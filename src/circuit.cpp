@@ -64,6 +64,13 @@ void Circuit::read_placement(const std::string& json_path) {
         p_parsed.push_back(std::move(p));
     }
 
+    // Optional explicit pin list (CFET export); otherwise every non-integer net
+    // name is an external pin, as in the stock placements.
+    if (data.contains("pins")) {
+        ext_pins.clear();
+        for (const auto& p : data.at("pins")) ext_pins.insert(p.get<std::string>());
+    }
+
     std::unordered_set<std::string> used_names;
     auto build = [&](const std::vector<ParsedDevice>& parsed, std::vector<Mosfet>& out) {
         for (const auto& d : parsed) {

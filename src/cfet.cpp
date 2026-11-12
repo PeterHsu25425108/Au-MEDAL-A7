@@ -66,16 +66,52 @@ std::vector<long> all_centres(const Config& cfg) {
 
 bool is_cfet(const Config& cfg) { return cfg.specs.value("technology", std::string()) == "cfet_a7"; }
 
+namespace {
+// Column-exact net order of one row: an edge dummy gate, then each device's
+// D, G, S with consecutive devices sharing the S/D column (the placement
+// lists them abutted), a "dummy" device being one empty gate column, and an
+// edge dummy gate. Unlike compute_net_orders nothing is stripped or inserted,
+// so the two rows of a DR cell stay column-aligned as placed.
+NetOrders row_order(const std::vector<Mosfet>& n, const std::vector<Mosfet>& p) {
+    NetOrders no;
+    auto push = [&](const std::string& a, const std::string& b) {
+        no.n_net.push_back(a); no.p_net.push_back(b); no.n_fins.push_back(0); no.p_fins.push_back(0);
+    };
+    push(DUMMY_NET, DUMMY_NET);
+    for (size_t i = 0; i < n.size(); ++i) {
+        const Mosfet& a = n[i];
+        const Mosfet& b = p[i];
+        if (no.n_net.size() == 1) push(a.drain, b.drain);
+        else {
+            std::string& ln = no.n_net.back();
+            std::string& lp = no.p_net.back();
+            auto fits = [](const std::string& last, const std::string& d) {
+                return last == d || last == DUMMY_NET || d == DUMMY_NET;
+            };
+            if (!fits(ln, a.drain) || !fits(lp, b.drain))
+                throw std::runtime_error("cfet placement: column " + std::to_string(i) +
+                                         " does not abut the previous one (" + ln + "/" + lp + " vs " +
+                                         a.drain + "/" + b.drain + "); insert a dummy column");
+            if (a.drain != DUMMY_NET) ln = a.drain;
+            if (b.drain != DUMMY_NET) lp = b.drain;
+        }
+        push(a.gate, b.gate);
+        push(a.source, b.source);
+    }
+    push(DUMMY_NET, DUMMY_NET);
+    return no;
+}
+}  // namespace
+
 CfetRows cfet_rows(const Config& cfg, const Circuit& circ) {
     CfetRows out;
     const long R = nrows(cfg);
     if ((long)circ.row_nfets.size() > R)
         throw std::runtime_error("placement uses more rows than the config's cfet.rows");
-    const long diff_break = cfg.specs.at("diffusion_break").get<long>();
     for (long r = 0; r < R; ++r) {
         NetOrders no;
         if (r < (long)circ.row_nfets.size() && !circ.row_nfets[r].empty())
-            no = compute_net_orders(circ.row_nfets[r], circ.row_pfets[r], diff_break);
+            no = row_order(circ.row_nfets[r], circ.row_pfets[r]);
         out.rows.push_back(no);
         out.ncols = std::max(out.ncols, (long)no.n_net.size());
     }
