@@ -172,6 +172,28 @@ std::vector<z3::expr> collect_graph_constraints(SmtModel& smt, const Config& cfg
     return all;
 }
 
+// CFET: the MRW at a centreline column joins the MD and BMD nodes there, so
+// two different nets may not use them (one would short the other through it).
+std::vector<z3::expr> cfet_mrw_one_net(SmtModel& smt, const Config& cfg, const RoutingGraph& g,
+                                      const std::vector<Net>& nets) {
+    const int zmd = cfg.routing_layer_index("MD"), zbmd = cfg.routing_layer_index("BMD");
+    std::vector<z3::expr> out;
+    if (zmd < 0 || zbmd < 0) return out;
+    std::vector<std::string> names;
+    for (const Net& n : nets) if (!n.is_power && n.name != DUMMY_NET) names.push_back(n.name);
+    for (const Arr& p : g.nodes) {
+        if (p[2] != zbmd) continue;
+        const Arr q{p[0], p[1], zmd};
+        if (!g.nodes.count(q)) continue;
+        for (const auto& a : names)
+            for (const auto& b : names)
+                if (a != b)
+                    out.push_back(!(smt.bool_var(net_point_var_name(a, q[0], q[1], q[2])) &&
+                                    smt.bool_var(net_point_var_name(b, p[0], p[1], p[2]))));
+    }
+    return out;
+}
+
 std::vector<z3::expr> collect_net_constraints(SmtModel& smt, const Config& cfg,
                                                  const std::vector<std::vector<long>>& xp,
                                                  const std::vector<std::vector<long>>& yp,
@@ -184,6 +206,7 @@ std::vector<z3::expr> collect_net_constraints(SmtModel& smt, const Config& cfg,
     append(all, smt.add_pin_grid_lock(cfg, g, cnets));
     append(all, smt.add_commodity_flow(cfg, g, cnets));
     append(all, smt.add_minimum_pin_length(cfg, xp, yp, g, cnets));
+    if (is_cfet(cfg)) append(all, cfet_mrw_one_net(smt, cfg, g, cnets));
     return all;
 }
 

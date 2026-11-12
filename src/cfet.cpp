@@ -387,6 +387,19 @@ void cfet_write_gds(const std::string& path, const std::string& cell_name, const
         }
     }
 
+    // ---- MRW: present wherever a contact reaches the centreline (spec 4: a
+    // contact extends over the MRW slot only to land on an MRW)
+    {
+        std::set<std::pair<long, long>> mrw_at;
+        std::set<long> cs;
+        for (long c : all_centres(cfg)) cs.insert(c);
+        for (const auto& e : res.metals)
+            for (const Arr* n : {&e.first, &e.second})
+                if (((*n)[2] == zmd || (*n)[2] == zbmd) && cs.count((*n)[1])) mrw_at.insert({(*n)[0], (*n)[1]});
+        for (const auto& xy : mrw_at)
+            S.add("MRW", xy.first - mrw[0] / 2.0, xy.second - mrw[1] / 2.0, xy.first + mrw[0] / 2.0, xy.second + mrw[1] / 2.0);
+    }
+
     // ---- routed wires: merge used in-layer edges into straight segments
     std::map<long, std::vector<std::pair<Arr, Arr>>> by_z;
     std::set<Arr> via_lo, via_hi;   // nodes with a via below / above
@@ -407,8 +420,7 @@ void cfet_write_gds(const std::string& path, const std::string& cell_name, const
             else if (a == "M1" && b == "M2") v = "V1";
             else throw std::runtime_error("cfet gds: unexpected via " + a + "-" + b);
             const std::vector<long> s = via_size(cfg, v.c_str());
-            if (v == "MRW") S.add("MRW", x - s[0] / 2.0, y - s[1] / 2.0, x + s[0] / 2.0, y + s[1] / 2.0);
-            else S.add(v, x - s[0] / 2.0, y - s[1] / 2.0, x + s[0] / 2.0, y + s[1] / 2.0);
+            if (v != "MRW") S.add(v, x - s[0] / 2.0, y - s[1] / 2.0, x + s[0] / 2.0, y + s[1] / 2.0);
         }
     }
     // Along-wire half length of the via at a node (0 without via).
