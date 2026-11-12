@@ -1,6 +1,8 @@
 // RoutingResult and the solver entry points.
 #pragma once
 #include <array>
+#include <set>
+#include <string>
 #include <utility>
 #include <vector>
 #include "circuit.hpp"
@@ -26,6 +28,9 @@ struct RoutingResult {
     long via_count = 0;
     long total_length = 0;
     long num_constraints = 0;
+    // CFET path only: which net uses each routed edge, and the external nets.
+    std::vector<std::pair<std::string, std::pair<std::array<long, 3>, std::array<long, 3>>>> net_edges;
+    std::set<std::string> ext_nets;
 };
 
 RoutingResult solve_cell(const Config& cfg,

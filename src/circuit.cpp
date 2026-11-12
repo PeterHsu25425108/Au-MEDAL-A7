@@ -1,5 +1,6 @@
 // Parses the placement JSON into ordered NMOS/PMOS device lists.
 #include "circuit.hpp"
+#include <algorithm>
 #include <fstream>
 #include <stdexcept>
 #include <unordered_set>
@@ -79,6 +80,22 @@ void Circuit::read_placement(const std::string& json_path) {
     };
     build(n_parsed, nfets);
     build(p_parsed, pfets);
+
+    // Same devices, split by row. The names repeat those built above.
+    long max_row = 0;
+    std::vector<long> col_row;
+    for (const auto& col : columns) {
+        long r = col.value("row", 0L);
+        if (r < 0) throw std::runtime_error("Invalid 'row' in " + json_path);
+        col_row.push_back(r);
+        max_row = std::max(max_row, r);
+    }
+    row_nfets.assign(max_row + 1, {});
+    row_pfets.assign(max_row + 1, {});
+    for (size_t i = 0; i < col_row.size(); ++i) {
+        row_nfets[col_row[i]].push_back(nfets[i]);
+        row_pfets[col_row[i]].push_back(pfets[i]);
+    }
 }
 
 }

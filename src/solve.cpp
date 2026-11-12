@@ -16,6 +16,7 @@
 #include <unordered_set>
 
 #include "json.hpp"
+#include "cfet.hpp"
 #include "netpoints.hpp"
 #include "smt.hpp"
 #include "variables.hpp"
@@ -98,8 +99,10 @@ std::vector<z3::expr> collect_graph_constraints(SmtModel& smt, const Config& cfg
     append(all, smt.add_side_to_tip_spacing(cfg, xp, yp, g));
     append(all, smt.add_corner_spacing(cfg, xp, yp, g));
     append(all, smt.add_via_spacing(cfg, xp, yp, g));
-    long num_poly = ((long)no.n_net.size() + 1) / 2;
-    pre.build_blockage(cfg, no, cnets, num_poly, 1);
+    if (!is_cfet(cfg)) {   // CFET: no pre-placed blockage; fixed shapes sit off the routing tracks
+        long num_poly = ((long)no.n_net.size() + 1) / 2;
+        pre.build_blockage(cfg, no, cnets, num_poly, 1);
+    }
     append(all, smt.add_pre_layout_blockage(cfg, xp, yp, g, pre));
     return all;
 }
@@ -517,7 +520,8 @@ RoutingResult solve_cell(const Config& cfg, const std::vector<std::vector<long>>
     for (long T : schedule) {
         smt.tolerance = T;
         std::vector<Net> cnets_T = cnets;
-        add_ext_pin_points(cnets_T, cfg, x_points, ext_pin_y_tracks, T);
+        if (is_cfet(cfg)) cfet_add_ext_pin_points(cnets_T, cfg, x_points, T);
+        else add_ext_pin_points(cnets_T, cfg, x_points, ext_pin_y_tracks, T);
         add_access_points(cnets_T, cfg, x_points, y_points, T);
         std::vector<z3::expr> net_constraints = collect_net_constraints(smt, cfg, x_points, y_points, g, cnets_T);
 
@@ -567,6 +571,14 @@ RoutingResult solve_cell(const Config& cfg, const std::vector<std::vector<long>>
                           [&](const std::string& nm) { return m.eval(smt.bool_var(nm), false).is_true(); }, r);
             recompute_route_metrics(r);
         }
+        if (is_cfet(cfg)) {
+            for (const Net& n : cnets_T) {
+                if (n.is_ext_pin) r.ext_nets.insert(n.name);
+                for (const auto& e : r.metals)
+                    if (m.eval(smt.bool_var(net_edge_var_name(n.name, e.first, e.second)), false).is_true())
+                        r.net_edges.push_back({n.name, e});
+            }
+        }
         for (const auto& h : handles) {
             z3::expr lo = opt.lower(h);
             r.objective_values.push_back(lo.is_numeral() ? (long)lo.get_numeral_int64() : -1);
@@ -610,6 +622,20 @@ RoutingResult solve_router(const Config& cfg, const Circuit& circ, const NetOrde
         auto it = std::find(cfg_t.routing_layers.begin(), cfg_t.routing_layers.end(), top);
         if (it != cfg_t.routing_layers.end()) cfg_t.routing_layers.erase(it + 1, cfg_t.routing_layers.end());
 
+        if (is_cfet(cfg_t)) {
+            const CfetRows rows = cfet_rows(cfg_t, circ);
+            CfetTracks t = cfet_tracks(cfg_t, rows);
+            std::vector<Net> cnets = cfet_net_points(cfg_t, circ, rows);
+            PreLayout pre;
+            auto rg = build_routing_graph(cfg_t, t.x, t.y, t.ext_pin_y, pre);
+            cfet_prune_graph(cfg_t, rows, cnets, rg);
+            RoutingResult r = solve_cell(cfg_t, t.x, t.y, t.ext_pin_y, rg, cnets, pre, rows.rows[0], debug_dump_default);
+            r.top_layer = top;
+            if (r.sat) return r;
+            last = r;
+            last.top_layer = top;
+            continue;
+        }
         auto xp = get_x_points(cfg_t, (long)no.n_net.size());
         auto yp = get_y_points(cfg_t, cfg_t.opt_bool("allow_below_min_track"));
         auto cnets = compute_net_points(cfg_t, circ, no, yp.y_points);

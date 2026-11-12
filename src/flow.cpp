@@ -16,6 +16,7 @@
 #include "prelayout.hpp"
 #include "solve.hpp"
 #include "gds.hpp"
+#include "cfet.hpp"
 
 namespace {
 
@@ -72,6 +73,12 @@ struct Logger {
 
 aumedal::RoutingResult route_cell(const aumedal::Config& cfg, const aumedal::Circuit& circ,
                                   const std::string& cell_name, const std::string& gds_out) {
+    if (aumedal::is_cfet(cfg)) {
+        const aumedal::CfetRows rows = aumedal::cfet_rows(cfg, circ);
+        aumedal::RoutingResult r = aumedal::solve_router(cfg, circ, rows.rows[0], "");
+        if (r.sat && !gds_out.empty()) aumedal::cfet_write_gds(gds_out, cell_name, cfg, r, rows);
+        return r;
+    }
     const long diff_break = cfg.specs.at("diffusion_break").get<long>();
     aumedal::NetOrders no = aumedal::compute_net_orders(circ.nfets, circ.pfets, diff_break);
     auto yp = aumedal::get_y_points(cfg, cfg.opt_bool("allow_below_min_track"));
