@@ -16,6 +16,7 @@
 #include <unordered_set>
 
 #include "json.hpp"
+#include "cfet.hpp"
 #include "netpoints.hpp"
 #include "smt.hpp"
 #include "variables.hpp"
@@ -77,6 +78,67 @@ std::optional<ExtPin> try_parse_ext_pin(const std::string& nm) {
     return ExtPin{parts[2], std::stol(parts[3]), std::stol(parts[4]), std::stol(parts[5])};
 }
 
+// CFET: a via landing on a metal layer (M0/M1/M2/BM0) must sit on a wire of
+// that layer, so that minimum_area governs its length. Without this a via
+// stack leaves a landing pad shorter than the minimum wire length.
+std::vector<z3::expr> cfet_landing_needs_wire(SmtModel& smt, const Config& cfg, const RoutingGraph& g) {
+    std::set<int> metal;
+    for (const char* l : {"BM0", "M0", "M1", "M2"}) { int z = cfg.routing_layer_index(l); if (z >= 0) metal.insert(z); }
+    std::map<Arr, std::vector<std::pair<Arr, Arr>>> vias, wires;
+    for (const auto& e : g.edges) {
+        for (const Arr* p : {&e.first, &e.second}) {
+            if (!metal.count((int)(*p)[2])) continue;
+            if (e.first[2] == e.second[2]) wires[*p].push_back(e);
+            else vias[*p].push_back(e);
+        }
+    }
+    std::vector<z3::expr> out;
+    for (const auto& kv : vias) {
+        z3::expr_vector any_wire(smt.ctx);
+        auto it = wires.find(kv.first);
+        if (it != wires.end())
+            for (const auto& e : it->second) any_wire.push_back(smt.bool_var(edge_var_name(e.first, e.second)));
+        for (const auto& e : kv.second) {
+            z3::expr v = smt.bool_var(edge_var_name(e.first, e.second));
+            out.push_back(any_wire.empty() ? !v : (!v || z3::mk_or(any_wire)));
+        }
+    }
+    return out;
+}
+
+// CFET: minimum wire length along the routing direction. Every (left tip,
+// right tip) pair closer than min_area / width is forbidden on its own; the
+// stock minimum_area ORs the candidates of a point together, which is only
+// tight when one candidate exists (ASAP7's coarse grid), not on A7's grid.
+std::vector<z3::expr> cfet_min_length(SmtModel& smt, const Config& cfg,
+                                      const std::vector<std::vector<long>>& xp,
+                                      const std::vector<std::vector<long>>& yp, const RoutingGraph& g) {
+    std::vector<z3::expr> out;
+    for (int z = 0; z < (int)cfg.routing_layers.size(); ++z) {
+        const std::string& layer = cfg.routing_layers[z];
+        const double min_area = cfg.rules.at("min_area").at(layer).get<double>();
+        if (min_area <= 0) continue;
+        const double min_len = min_area / cfg.width(layer);
+        const long ext = cfg.rules.at("extension").at(layer).get<long>();
+        const bool horiz = cfg.routing_directions[z] == HORIZONTAL;
+        const auto& along = horiz ? xp[z] : yp[z];
+        const auto& across = horiz ? yp[z] : xp[z];
+        for (long c : across)
+            for (size_t i = 0; i < along.size(); ++i) {
+                const Arr a = horiz ? Arr{along[i], c, z} : Arr{c, along[i], z};
+                if (!g.nodes.count(a)) continue;
+                z3::expr lo = smt.bool_var(point_var_name(horiz ? "TIP_L" : "TIP_B", a[0], a[1], a[2]));
+                for (size_t j = i; j < along.size() && (double)(along[j] - along[i] + ext) < min_len; ++j) {
+                    const Arr b = horiz ? Arr{along[j], c, z} : Arr{c, along[j], z};
+                    if (!g.nodes.count(b)) continue;
+                    z3::expr hi = smt.bool_var(point_var_name(horiz ? "TIP_R" : "TIP_T", b[0], b[1], b[2]));
+                    out.push_back(!(lo && hi));
+                }
+            }
+    }
+    return out;
+}
+
 std::vector<z3::expr> collect_graph_constraints(SmtModel& smt, const Config& cfg,
                                                    const std::vector<std::vector<long>>& xp,
                                                    const std::vector<std::vector<long>>& yp,
@@ -98,10 +160,38 @@ std::vector<z3::expr> collect_graph_constraints(SmtModel& smt, const Config& cfg
     append(all, smt.add_side_to_tip_spacing(cfg, xp, yp, g));
     append(all, smt.add_corner_spacing(cfg, xp, yp, g));
     append(all, smt.add_via_spacing(cfg, xp, yp, g));
-    long num_poly = ((long)no.n_net.size() + 1) / 2;
-    pre.build_blockage(cfg, no, cnets, num_poly, 1);
+    if (is_cfet(cfg)) {
+        append(all, cfet_landing_needs_wire(smt, cfg, g));
+        append(all, cfet_min_length(smt, cfg, xp, yp, g));
+    }
+    if (!is_cfet(cfg)) {   // CFET: no pre-placed blockage; fixed shapes sit off the routing tracks
+        long num_poly = ((long)no.n_net.size() + 1) / 2;
+        pre.build_blockage(cfg, no, cnets, num_poly, 1);
+    }
     append(all, smt.add_pre_layout_blockage(cfg, xp, yp, g, pre));
     return all;
+}
+
+// CFET: the MRW at a centreline column joins the MD and BMD nodes there, so
+// two different nets may not use them (one would short the other through it).
+std::vector<z3::expr> cfet_mrw_one_net(SmtModel& smt, const Config& cfg, const RoutingGraph& g,
+                                      const std::vector<Net>& nets) {
+    const int zmd = cfg.routing_layer_index("MD"), zbmd = cfg.routing_layer_index("BMD");
+    std::vector<z3::expr> out;
+    if (zmd < 0 || zbmd < 0) return out;
+    std::vector<std::string> names;
+    for (const Net& n : nets) if (!n.is_power && n.name != DUMMY_NET) names.push_back(n.name);
+    for (const Arr& p : g.nodes) {
+        if (p[2] != zbmd) continue;
+        const Arr q{p[0], p[1], zmd};
+        if (!g.nodes.count(q)) continue;
+        for (const auto& a : names)
+            for (const auto& b : names)
+                if (a != b)
+                    out.push_back(!(smt.bool_var(net_point_var_name(a, q[0], q[1], q[2])) &&
+                                    smt.bool_var(net_point_var_name(b, p[0], p[1], p[2]))));
+    }
+    return out;
 }
 
 std::vector<z3::expr> collect_net_constraints(SmtModel& smt, const Config& cfg,
@@ -116,6 +206,7 @@ std::vector<z3::expr> collect_net_constraints(SmtModel& smt, const Config& cfg,
     append(all, smt.add_pin_grid_lock(cfg, g, cnets));
     append(all, smt.add_commodity_flow(cfg, g, cnets));
     append(all, smt.add_minimum_pin_length(cfg, xp, yp, g, cnets));
+    if (is_cfet(cfg)) append(all, cfet_mrw_one_net(smt, cfg, g, cnets));
     return all;
 }
 
@@ -517,7 +608,8 @@ RoutingResult solve_cell(const Config& cfg, const std::vector<std::vector<long>>
     for (long T : schedule) {
         smt.tolerance = T;
         std::vector<Net> cnets_T = cnets;
-        add_ext_pin_points(cnets_T, cfg, x_points, ext_pin_y_tracks, T);
+        if (is_cfet(cfg)) cfet_add_ext_pin_points(cnets_T, cfg, x_points, T);
+        else add_ext_pin_points(cnets_T, cfg, x_points, ext_pin_y_tracks, T);
         add_access_points(cnets_T, cfg, x_points, y_points, T);
         std::vector<z3::expr> net_constraints = collect_net_constraints(smt, cfg, x_points, y_points, g, cnets_T);
 
@@ -567,6 +659,14 @@ RoutingResult solve_cell(const Config& cfg, const std::vector<std::vector<long>>
                           [&](const std::string& nm) { return m.eval(smt.bool_var(nm), false).is_true(); }, r);
             recompute_route_metrics(r);
         }
+        if (is_cfet(cfg)) {
+            for (const Net& n : cnets_T) {
+                if (n.is_ext_pin) r.ext_nets.insert(n.name);
+                for (const auto& e : r.metals)
+                    if (m.eval(smt.bool_var(net_edge_var_name(n.name, e.first, e.second)), false).is_true())
+                        r.net_edges.push_back({n.name, e});
+            }
+        }
         for (const auto& h : handles) {
             z3::expr lo = opt.lower(h);
             r.objective_values.push_back(lo.is_numeral() ? (long)lo.get_numeral_int64() : -1);
@@ -610,6 +710,20 @@ RoutingResult solve_router(const Config& cfg, const Circuit& circ, const NetOrde
         auto it = std::find(cfg_t.routing_layers.begin(), cfg_t.routing_layers.end(), top);
         if (it != cfg_t.routing_layers.end()) cfg_t.routing_layers.erase(it + 1, cfg_t.routing_layers.end());
 
+        if (is_cfet(cfg_t)) {
+            const CfetRows rows = cfet_rows(cfg_t, circ);
+            CfetTracks t = cfet_tracks(cfg_t, rows);
+            std::vector<Net> cnets = cfet_net_points(cfg_t, circ, rows);
+            PreLayout pre;
+            auto rg = build_routing_graph(cfg_t, t.x, t.y, t.ext_pin_y, pre);
+            cfet_prune_graph(cfg_t, rows, cnets, rg);
+            RoutingResult r = solve_cell(cfg_t, t.x, t.y, t.ext_pin_y, rg, cnets, pre, rows.rows[0], debug_dump_default);
+            r.top_layer = top;
+            if (r.sat) return r;
+            last = r;
+            last.top_layer = top;
+            continue;
+        }
         auto xp = get_x_points(cfg_t, (long)no.n_net.size());
         auto yp = get_y_points(cfg_t, cfg_t.opt_bool("allow_below_min_track"));
         auto cnets = compute_net_points(cfg_t, circ, no, yp.y_points);

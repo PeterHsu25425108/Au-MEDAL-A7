@@ -21,7 +21,7 @@ endif()
 set(AUMEDAL_SRC
   src/flow.cpp src/config.cpp src/circuit.cpp src/placement.cpp src/netpoints.cpp
   src/prelayout.cpp src/graph.cpp src/variables.cpp src/smt.cpp src/smt_spacing.cpp
-  src/smt_net.cpp src/prelayout_blockage.cpp src/solve.cpp src/gds.cpp)
+  src/smt_net.cpp src/prelayout_blockage.cpp src/solve.cpp src/gds.cpp src/cfet.cpp)
 
 add_executable(flow ${AUMEDAL_SRC})
 target_include_directories(flow PRIVATE ${Z3_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/src/include)
