@@ -459,10 +459,12 @@ void cfet_write_gds(const std::string& path, const std::string& cell_name, const
             if (v != "MRW") S.add(v, x - s[0] / 2.0, y - s[1] / 2.0, x + s[0] / 2.0, y + s[1] / 2.0);
         }
     }
-    // Along-wire half length of the via at a node (0 without via).
+    // How far a wire reaches past its end node: the via's half length plus the
+    // enclosure, at least half the node size of Au-MEDAL's model (extension / 2),
+    // which its minimum-length and tip-to-tip constraints assume.
     auto via_reach = [&](const Arr& n, bool horizontal) -> double {
-        double best = 0;
         const std::string l = lname(n[2]);
+        double best = cfg.rules.at("extension").at(l).get<double>() / 2.0;
         auto take = [&](const char* v) {
             const std::vector<long> s = via_size(cfg, v);
             best = std::max(best, (horizontal ? s[0] : s[1]) / 2.0 + enc);
