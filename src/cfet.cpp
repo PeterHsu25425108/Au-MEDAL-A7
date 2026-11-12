@@ -373,12 +373,12 @@ void cfet_write_gds(const std::string& path, const std::string& cell_name, const
     // ---- fixed geometry
     S.add("BOUNDARY", 0, 0, W, H);
     const long m0r = cl(cfg, "m0_rail_half"), bm0r = cl(cfg, "bm0_rail_half");
-    for (long k = 0; k <= R; k += 2) {                          // edge rails, clipped at the boundary
-        const long y = k * row_h(cfg);
-        S.add("M0", 0, std::max(0L, y - m0r), W, std::min(H, y + m0r));
-        S.add("BM0", 0, std::max(0L, y - bm0r), W, std::min(H, y + bm0r));
-        S.labels.push_back({cfg.ground_net, W / 2.0, y == 0 ? m0r / 2.0 : H - m0r / 2.0, "M0"});
-        S.labels.push_back({cfg.power_net, W / 2.0, y == 0 ? bm0r / 2.0 : H - bm0r / 2.0, "BM0"});
+    for (long k = 0; k <= R; k += 2) {                          // edge rails, full width centred on the edge
+        const long y = k * row_h(cfg);                           // (spec §2: half of each belongs to the neighbour)
+        S.add("M0", 0, y - m0r, W, y + m0r);
+        S.add("BM0", 0, y - bm0r, W, y + bm0r);
+        S.labels.push_back({cfg.ground_net, W / 2.0, y == 0 ? m0r / 2.0 : H - m0r / 2.0, "M0"});   // inside the cell,
+        S.labels.push_back({cfg.power_net, W / 2.0, y == 0 ? bm0r / 2.0 : H - bm0r / 2.0, "BM0"}); // apart from each other
     }
     for (long c : all_centres(cfg)) {                          // centreline backside VSS, whole
         S.add("BM0", 0, c - bm0r, W, c + bm0r);
