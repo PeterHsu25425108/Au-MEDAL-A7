@@ -6,6 +6,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -223,8 +224,20 @@ std::vector<Net> cfet_net_points(const Config& cfg, const Circuit& circ, const C
             }
         }
     }
+    // Debugging aid: CFET_ONLY_NETS=a,b,c routes only those nets (the others
+    // keep their terminals but get no pins), to find a net that cannot route
+    // even alone.
+    std::set<std::string> only;
+    if (const char* e = std::getenv("CFET_ONLY_NETS")) {
+        std::string cur;
+        for (const char* c = e;; ++c) {
+            if (*c == ',' || *c == 0) { if (!cur.empty()) only.insert(cur); cur.clear(); if (!*c) break; }
+            else cur += *c;
+        }
+    }
     std::vector<Net> out;
-    for (const auto& name : b.order) out.push_back(b.nets.at(name));
+    for (const auto& name : b.order)
+        if (only.empty() || only.count(name)) out.push_back(b.nets.at(name));
     return out;
 }
 
