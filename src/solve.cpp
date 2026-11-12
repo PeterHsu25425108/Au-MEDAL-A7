@@ -78,6 +78,67 @@ std::optional<ExtPin> try_parse_ext_pin(const std::string& nm) {
     return ExtPin{parts[2], std::stol(parts[3]), std::stol(parts[4]), std::stol(parts[5])};
 }
 
+// CFET: a via landing on a metal layer (M0/M1/M2/BM0) must sit on a wire of
+// that layer, so that minimum_area governs its length. Without this a via
+// stack leaves a landing pad shorter than the minimum wire length.
+std::vector<z3::expr> cfet_landing_needs_wire(SmtModel& smt, const Config& cfg, const RoutingGraph& g) {
+    std::set<int> metal;
+    for (const char* l : {"BM0", "M0", "M1", "M2"}) { int z = cfg.routing_layer_index(l); if (z >= 0) metal.insert(z); }
+    std::map<Arr, std::vector<std::pair<Arr, Arr>>> vias, wires;
+    for (const auto& e : g.edges) {
+        for (const Arr* p : {&e.first, &e.second}) {
+            if (!metal.count((int)(*p)[2])) continue;
+            if (e.first[2] == e.second[2]) wires[*p].push_back(e);
+            else vias[*p].push_back(e);
+        }
+    }
+    std::vector<z3::expr> out;
+    for (const auto& kv : vias) {
+        z3::expr_vector any_wire(smt.ctx);
+        auto it = wires.find(kv.first);
+        if (it != wires.end())
+            for (const auto& e : it->second) any_wire.push_back(smt.bool_var(edge_var_name(e.first, e.second)));
+        for (const auto& e : kv.second) {
+            z3::expr v = smt.bool_var(edge_var_name(e.first, e.second));
+            out.push_back(any_wire.empty() ? !v : (!v || z3::mk_or(any_wire)));
+        }
+    }
+    return out;
+}
+
+// CFET: minimum wire length along the routing direction. Every (left tip,
+// right tip) pair closer than min_area / width is forbidden on its own; the
+// stock minimum_area ORs the candidates of a point together, which is only
+// tight when one candidate exists (ASAP7's coarse grid), not on A7's grid.
+std::vector<z3::expr> cfet_min_length(SmtModel& smt, const Config& cfg,
+                                      const std::vector<std::vector<long>>& xp,
+                                      const std::vector<std::vector<long>>& yp, const RoutingGraph& g) {
+    std::vector<z3::expr> out;
+    for (int z = 0; z < (int)cfg.routing_layers.size(); ++z) {
+        const std::string& layer = cfg.routing_layers[z];
+        const double min_area = cfg.rules.at("min_area").at(layer).get<double>();
+        if (min_area <= 0) continue;
+        const double min_len = min_area / cfg.width(layer);
+        const long ext = cfg.rules.at("extension").at(layer).get<long>();
+        const bool horiz = cfg.routing_directions[z] == HORIZONTAL;
+        const auto& along = horiz ? xp[z] : yp[z];
+        const auto& across = horiz ? yp[z] : xp[z];
+        for (long c : across)
+            for (size_t i = 0; i < along.size(); ++i) {
+                const Arr a = horiz ? Arr{along[i], c, z} : Arr{c, along[i], z};
+                if (!g.nodes.count(a)) continue;
+                z3::expr lo = smt.bool_var(point_var_name(horiz ? "TIP_L" : "TIP_B", a[0], a[1], a[2]));
+                for (size_t j = i; j < along.size() && (double)(along[j] - along[i] + ext) < min_len; ++j) {
+                    const Arr b = horiz ? Arr{along[j], c, z} : Arr{c, along[j], z};
+                    if (!g.nodes.count(b)) continue;
+                    z3::expr hi = smt.bool_var(point_var_name(horiz ? "TIP_R" : "TIP_T", b[0], b[1], b[2]));
+                    out.push_back(!(lo && hi));
+                }
+            }
+    }
+    return out;
+}
+
 std::vector<z3::expr> collect_graph_constraints(SmtModel& smt, const Config& cfg,
                                                    const std::vector<std::vector<long>>& xp,
                                                    const std::vector<std::vector<long>>& yp,
@@ -99,6 +160,10 @@ std::vector<z3::expr> collect_graph_constraints(SmtModel& smt, const Config& cfg
     append(all, smt.add_side_to_tip_spacing(cfg, xp, yp, g));
     append(all, smt.add_corner_spacing(cfg, xp, yp, g));
     append(all, smt.add_via_spacing(cfg, xp, yp, g));
+    if (is_cfet(cfg)) {
+        append(all, cfet_landing_needs_wire(smt, cfg, g));
+        append(all, cfet_min_length(smt, cfg, xp, yp, g));
+    }
     if (!is_cfet(cfg)) {   // CFET: no pre-placed blockage; fixed shapes sit off the routing tracks
         long num_poly = ((long)no.n_net.size() + 1) / 2;
         pre.build_blockage(cfg, no, cnets, num_poly, 1);
