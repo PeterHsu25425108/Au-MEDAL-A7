@@ -224,9 +224,9 @@ std::vector<Net> cfet_net_points(const Config& cfg, const Circuit& circ, const C
             }
         }
     }
-    // Debugging aid: CFET_ONLY_NETS=a,b,c routes only those nets (the others
-    // keep their terminals but get no pins), to find a net that cannot route
-    // even alone.
+    // Debugging aid: CFET_ONLY_NETS=a,b,c routes only those nets, to find a
+    // set of nets that cannot route together. The contacts and gates of the
+    // other nets stay in the layout as obstacles (cfet_prune_graph).
     std::set<std::string> only;
     if (const char* e = std::getenv("CFET_ONLY_NETS")) {
         std::string cur;
@@ -241,8 +241,13 @@ std::vector<Net> cfet_net_points(const Config& cfg, const Circuit& circ, const C
     return out;
 }
 
-void cfet_prune_graph(const Config& cfg, const CfetRows& rows, const std::vector<Net>&,
+void cfet_prune_graph(const Config& cfg, const CfetRows& rows, const std::vector<Net>& nets,
                       RoutingGraph& g) {
+    // A signal net missing from `nets` (CFET_ONLY_NETS) is not routed: its MD,
+    // BMD and GATE shapes get no nodes, so no other net can run through them.
+    // With every net listed this changes nothing.
+    std::set<std::string> routed;
+    for (const Net& n : nets) routed.insert(n.name);
     const int zg = zi(cfg, "GATE"), zmd = zi(cfg, "MD"), zbmd = zi(cfg, "BMD");
     // Which rows (by y) a coordinate belongs to; centreline belongs to both of its rows.
     auto row_of = [&](long y) { return std::min(nrows(cfg) - 1, y / row_h(cfg)); };
@@ -259,10 +264,11 @@ void cfet_prune_graph(const Config& cfg, const CfetRows& rows, const std::vector
             const std::string& p = no.p_net[xi];
             if (xi % 2 == 0) {
                 if (is_dummy(n) && is_dummy(p)) continue;
+                if (!routed.count(is_dummy(n) ? p : n)) continue;
                 for (long y : sig) ok.insert({x, y, zg});
             } else {
-                const bool n_sig = !is_dummy(n) && !is_supply(cfg, n);
-                const bool p_sig = !is_dummy(p) && !is_supply(cfg, p);
+                const bool n_sig = !is_dummy(n) && !is_supply(cfg, n) && routed.count(n);
+                const bool p_sig = !is_dummy(p) && !is_supply(cfg, p) && routed.count(p);
                 if (n_sig) { for (long y : sig) ok.insert({x, y, zmd}); ok.insert({x, c, zmd}); }
                 if (p_sig) {
                     for (long y : bsig) ok.insert({x, y, zbmd});
