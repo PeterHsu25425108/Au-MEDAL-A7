@@ -635,16 +635,16 @@ std::vector<z3::expr> SmtModel::cross_layer_via_block(
         const long layer_width = cfg.width(layer);
         auto lv = cfg.lower_via.find(layer);
         if (lv == cfg.lower_via.end() || !lv->second.has_value()) continue;
-        const long via_width = cfg.width(*lv->second);
+        const long via_wx = cfg.via_wx(*lv->second), via_wy = cfg.via_wy(*lv->second);
         const auto& xs = x_points[curr_z];
         const auto& ys = y_points[curr_z];
 
         for (size_t vxi = 0; vxi < xs.size(); ++vxi) {
             const long cvx = xs[vxi];
-            const double min_via_x = cvx - via_width / 2.0, max_via_x = cvx + via_width / 2.0;
+            const double min_via_x = cvx - via_wx / 2.0, max_via_x = cvx + via_wx / 2.0;
             for (size_t vyi = 0; vyi < ys.size(); ++vyi) {
                 const long cvy = ys[vyi];
-                const double min_via_y = cvy - via_width / 2.0, max_via_y = cvy + via_width / 2.0;
+                const double min_via_y = cvy - via_wy / 2.0, max_via_y = cvy + via_wy / 2.0;
                 const Arr curr_point{cvx, cvy, curr_z};
                 if (!g.nodes.count(curr_point)) continue;
                 z3::expr venc_ver = bool_var(point_var_name("VIA_ENC_VER_L", cvx, cvy, curr_z));

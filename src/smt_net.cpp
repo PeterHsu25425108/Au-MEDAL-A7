@@ -662,8 +662,11 @@ std::vector<z3::expr> SmtModel::add_pre_layout_blockage(
                 const long x = p[0], y = p[1];
                 if (!xidx[z].count(x) || !yidx[z].count(y)) continue;
                 const int xi = xidx[z][x], yi = yidx[z][y];
-                const double x_ex = (routing_dir == ENC_HORIZONTAL) ? cfg.rules.at("extension").at(curr_layer).get<double>() : cfg.width(curr_layer);
-                const double y_ex = (routing_dir == ENC_VERTICAL) ? cfg.rules.at("extension").at(curr_layer).get<double>() : cfg.width(curr_layer);
+                // A via (routing_dir 2) is its footprint, square unless the config gives "via_size".
+                const double x_ex = (routing_dir == ENC_HORIZONTAL) ? cfg.rules.at("extension").at(curr_layer).get<double>()
+                                    : is_layer ? (double)cfg.width(curr_layer) : (double)cfg.via_wx(curr_layer);
+                const double y_ex = (routing_dir == ENC_VERTICAL) ? cfg.rules.at("extension").at(curr_layer).get<double>()
+                                    : is_layer ? (double)cfg.width(curr_layer) : (double)cfg.via_wy(curr_layer);
 
                 auto pv = [&](const char* prefix) {
                     return is_layer ? bool_var(point_var_name(prefix, x, y, z))
@@ -699,7 +702,8 @@ std::vector<z3::expr> SmtModel::add_pre_layout_blockage(
                             long via_enc_len = 0;
                             if (cfg.rules.at("enclosure").contains(via) && cfg.rules.at("enclosure").at(via).contains(curr_layer))
                                 via_enc_len = cfg.rules.at("enclosure").at(via).at(curr_layer).get<long>();
-                            const long via_width = cfg.width(via), metal_width = cfg.width(curr_layer);
+                            const long via_width = (enc_dir == ENC_HORIZONTAL) ? cfg.via_wx(via) : cfg.via_wy(via);
+                            const long metal_width = cfg.width(curr_layer);
                             const long metal_ex2 = cfg.rules.at("extension").at(curr_layer).get<long>();
                             const long along_ex = (via_enc_len != 0) ? (via_width + 2 * via_enc_len) : metal_ex2;
                             const double enc_x_ex = (enc_dir == ENC_HORIZONTAL) ? (double)along_ex : (double)metal_width;

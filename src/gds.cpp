@@ -567,15 +567,15 @@ void emit_via_enclosure_rects(const Config& cfg, const RoutingResult& res,
         const auto& via = (v.level == 0) ? cfg.lower_via.at(layer) : cfg.upper_via.at(layer);
         if (!via.has_value() || via->empty()) continue;
         const long metal_width = (v.y % ch == 0 && cfg.is_power_layer(layer)) ? cfg.power_width(layer) : cfg.width(layer);
-        const long metal_ex = ext_of(cfg, layer), via_width = cfg.width(*via);
+        const long metal_ex = ext_of(cfg, layer), via_wx = cfg.via_wx(*via), via_wy = cfg.via_wy(*via);
         const long enc = cfg.rules.at("enclosure").at(*via).at(layer).get<long>();
         long xe, ye, xmw, ymw;
         if (v.dir == HORIZONTAL) { xe = enc; ye = 0; xmw = metal_ex; ymw = metal_width; }
         else { xe = 0; ye = enc; xmw = metal_width; ymw = metal_ex; }
-        const double lx = (xe != 0) ? v.x - (via_width / 2.0 + xe) : v.x - xmw / 2.0;
-        const double ux = (xe != 0) ? v.x + (via_width / 2.0 + xe) : v.x + xmw / 2.0;
-        const double ly = (ye != 0) ? v.y - (via_width / 2.0 + ye) : v.y - ymw / 2.0;
-        const double uy = (ye != 0) ? v.y + (via_width / 2.0 + ye) : v.y + ymw / 2.0;
+        const double lx = (xe != 0) ? v.x - (via_wx / 2.0 + xe) : v.x - xmw / 2.0;
+        const double ux = (xe != 0) ? v.x + (via_wx / 2.0 + xe) : v.x + xmw / 2.0;
+        const double ly = (ye != 0) ? v.y - (via_wy / 2.0 + ye) : v.y - ymw / 2.0;
+        const double uy = (ye != 0) ? v.y + (via_wy / 2.0 + ye) : v.y + ymw / 2.0;
         add_cut(gds_layer(cfg, layer), {lx, ly, ux, uy});
     }
 }

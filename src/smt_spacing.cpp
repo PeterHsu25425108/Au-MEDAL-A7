@@ -32,7 +32,10 @@ long layer_enclosure(const Config& c, const std::optional<std::string>& via, con
     const auto& ev = enc.at(*via);
     if (!ev.contains(layer)) return 0;
     double e = ev.at(layer).get<double>();
-    return static_cast<long>(e + c.width(*via) / 2.0);
+    // A wire end on a via reaches enclosure + half the via's size along the wire.
+    const int li = c.routing_layer_index(layer);
+    const int dir = (li < 0) ? BIDIRECTION : c.routing_directions[li];
+    return static_cast<long>(e + c.via_along(*via, dir) / 2.0);
 }
 size_t bisect_right(const std::vector<long>& v, double key) {
     return std::upper_bound(v.begin(), v.end(), key,
@@ -71,20 +74,33 @@ void spacing_worker(SmtModel& m, std::vector<z3::expr>& out, const Config& cfg,
     }
 
     auto max3 = [](long a, long b, long c) { return std::max(a, std::max(b, c)); };
-    long max_curr_ex = max3(cfg.width(curr_layer), rl(cfg, "extension", curr_layer),
+    // Size of a shape along the scan axis and across it. A wire node is
+    // width(layer) across (its along size is decided per node below); a via is
+    // its footprint (square unless the config gives "via_size").
+    auto along_w = [&](const std::string& n) {
+        return is_layer ? cfg.width(n) : (is_horizontal ? cfg.via_wx(n) : cfg.via_wy(n));
+    };
+    auto across_w = [&](const std::string& n) {
+        return is_layer ? cfg.width(n) : (is_horizontal ? cfg.via_wy(n) : cfg.via_wx(n));
+    };
+    auto max_w = [&](const std::string& n) {
+        return is_layer ? cfg.width(n) : std::max(cfg.via_wx(n), cfg.via_wy(n));
+    };
+    long max_curr_ex = max3(max_w(curr_layer), rl(cfg, "extension", curr_layer),
                             in_power(cfg, curr_layer) ? cfg.power_width(curr_layer) : 0);
-    long max_next_ex = max3(cfg.width(next_layer), rl(cfg, "extension", next_layer),
+    long max_next_ex = max3(max_w(next_layer), rl(cfg, "extension", next_layer),
                             in_power(cfg, next_layer) ? cfg.power_width(next_layer) : 0);
     if (is_layer) {
         max_curr_ex = max3(max_curr_ex, curr_low_enc, curr_up_enc);
         max_next_ex = max3(max_next_ex, next_low_enc, next_up_enc);
     }
-    long max_width_curr = std::max(cfg.width(curr_layer), in_power(cfg, curr_layer) ? cfg.power_width(curr_layer) : 0L);
-    long max_width_next = std::max(cfg.width(next_layer), in_power(cfg, next_layer) ? cfg.power_width(next_layer) : 0L);
+    long max_width_curr = std::max(across_w(curr_layer), in_power(cfg, curr_layer) ? cfg.power_width(curr_layer) : 0L);
+    long max_width_next = std::max(across_w(next_layer), in_power(cfg, next_layer) ? cfg.power_width(next_layer) : 0L);
     const double overlap_limit = (max_width_curr + max_width_next) / 2.0;
     const double eps = 1e-9;
     const long cell_height = cfg.cell_height;
-    const long w_curr = cfg.width(curr_layer), w_next = cfg.width(next_layer);
+    const long w_curr = across_w(curr_layer), w_next = across_w(next_layer);
+    const long a_curr = along_w(curr_layer), a_next = along_w(next_layer);
     const double reach = spacing + max_curr_ex + max_next_ex;
 
     const std::string venc_base = is_horizontal ? "VIA_ENC_HOR" : "VIA_ENC_VER";
@@ -103,7 +119,7 @@ void spacing_worker(SmtModel& m, std::vector<z3::expr>& out, const Config& cfg,
         else if ((curr_dir == HORIZONTAL && is_horizontal) || (curr_dir == VERTICAL && !is_horizontal))
             curr_layer_ex = rl(cfg, "extension", curr_layer);
         else
-            curr_layer_ex = w_curr;
+            curr_layer_ex = a_curr;
 
         size_t x_start, x_end, y_start, y_end;
         if (is_horizontal) {
@@ -152,7 +168,7 @@ void spacing_worker(SmtModel& m, std::vector<z3::expr>& out, const Config& cfg,
                 else if ((next_dir == HORIZONTAL && is_horizontal) || (next_dir == VERTICAL && !is_horizontal))
                     next_layer_ex = rl(cfg, "extension", next_layer);
                 else
-                    next_layer_ex = w_next;
+                    next_layer_ex = a_next;
 
                 double overlapped_metal =
                     std::abs((double)(is_horizontal ? (next_y - curr_y) : (next_x - curr_x))) - w_curr / 2.0 - w_next / 2.0;
@@ -244,11 +260,20 @@ void corner_kernel(SmtModel& m, std::vector<z3::expr>& out, const Config& cfg,
     const long next_low_enc = is_layer ? layer_enclosure(cfg, cfg.lower_via.at(next_layer), next_layer) : 0;
     const long next_up_enc = is_layer ? layer_enclosure(cfg, cfg.upper_via.at(next_layer), next_layer) : 0;
 
-    const double curr_x_ex = std::max(cfg.width(curr_layer), rl(cfg, "extension", curr_layer));
+    // Node size in x and y: a wire node is a square of max(width, extension); a
+    // via with "via_size" in the config is its rectangle.
+    const bool curr_rect = !is_layer && cfg.has_via_size(curr_layer);
+    const bool next_rect = !is_layer && cfg.has_via_size(next_layer);
+    const double curr_x_ex = curr_rect ? (double)cfg.via_wx(curr_layer)
+                                       : std::max(cfg.width(curr_layer), rl(cfg, "extension", curr_layer));
+    const double curr_y_base = curr_rect ? (double)cfg.via_wy(curr_layer) : curr_x_ex;
+    const double next_x_ex = next_rect ? (double)cfg.via_wx(next_layer)
+                                       : std::max(cfg.width(next_layer), rl(cfg, "extension", next_layer));
+    const double next_y_base = next_rect ? (double)cfg.via_wy(next_layer) : next_x_ex;
     auto max4 = [](double a, double b, double c, double d) { return std::max(std::max(a, b), std::max(c, d)); };
-    const double max_curr_prune = max4(curr_x_ex / 2, curr_low_enc, curr_up_enc,
+    const double max_curr_prune = max4(std::max(curr_x_ex, curr_y_base) / 2, curr_low_enc, curr_up_enc,
                                        in_power(cfg, curr_layer) ? cfg.power_width(curr_layer) / 2.0 : 0.0);
-    const double max_next_prune = max4(std::max(cfg.width(next_layer), rl(cfg, "extension", next_layer)) / 2.0,
+    const double max_next_prune = max4(std::max(next_x_ex, next_y_base) / 2.0,
                                        next_low_enc, next_up_enc,
                                        in_power(cfg, next_layer) ? cfg.power_width(next_layer) / 2.0 : 0.0);
     const double spacing_sq = spacing * spacing;
@@ -275,16 +300,15 @@ void corner_kernel(SmtModel& m, std::vector<z3::expr>& out, const Config& cfg,
                 const long next_x = next_x_points[xi];
                 const long x_unit = next_x - curr_x;
                 if (x_unit - max_curr_prune - max_next_prune >= spacing) break;
-                const double next_x_ex = std::max(cfg.width(next_layer), rl(cfg, "extension", next_layer));
 
                 auto scan_next_y = [&](long next_y) -> bool {
                     const long y_unit = is_upward ? (next_y - curr_y) : (curr_y - next_y);
                     if (dist_sq(x_unit - max_curr_prune - max_next_prune, y_unit - max_curr_prune - max_next_prune) >= spacing_sq)
                         return false;
                     const double curr_y_ex = (curr_y % cell_height == 0 && in_power(cfg, curr_layer))
-                                                 ? (double)cfg.power_width(curr_layer) : curr_x_ex;
+                                                 ? (double)cfg.power_width(curr_layer) : curr_y_base;
                     const double next_y_ex = (next_y % cell_height == 0 && in_power(cfg, next_layer))
-                                                 ? (double)cfg.power_width(next_layer) : next_x_ex;
+                                                 ? (double)cfg.power_width(next_layer) : next_y_base;
                     const Arr np{next_x, next_y, next_z};
                     if (!node(np)) return true;
                     z3::expr next_var = m.bool_var(point_var_name(prefix2, next_x, next_y, next_z));

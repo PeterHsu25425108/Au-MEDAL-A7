@@ -348,7 +348,11 @@ struct Shapes {
     }
 };
 
-std::vector<long> via_size(const Config& cfg, const char* v) { return C(cfg).at("via_size").at(v).get<std::vector<long>>(); }
+// Drawn via size (x, y). VG and VD are both the cut layer VGD in the routing model.
+std::vector<long> via_size(const Config& cfg, const char* v) {
+    const std::string n = (std::string(v) == "VG" || std::string(v) == "VD") ? "VGD" : v;
+    return {cfg.via_wx(n), cfg.via_wy(n)};
+}
 
 }  // namespace
 
