@@ -430,6 +430,10 @@ void cfet_write_gds(const std::string& path, const std::string& cell_name, const
                 bool ext = false;
                 for (long y : pins) ext |= has({x, y, z}, {x, c, z});
                 if (ext) hi = cover;
+                // An MD that carries a VD up to the middle M0 track without an MRW
+                // extends just far enough to enclose that VD (enclosure along y).
+                if (ext && !tier && has({x, c, zmd}, {x, c, zm0}))
+                    hi = std::max(hi, row_h(cfg) + via_size(cfg, "VD")[1] / 2 + enc);
                 S.add(layer, x - kw / 2.0, ry(cfg, r, lo), x + kw / 2.0, ry(cfg, r, hi));
                 if (is_supply(cfg, net)) {
                     const long rail = ry(cfg, r, 0);
@@ -440,22 +444,14 @@ void cfet_write_gds(const std::string& path, const std::string& cell_name, const
         }
     }
 
-    // ---- MRW: where the solution goes through the centreline vertically, i.e. uses
-    // the BMD <-> MD via there, or a VD from the centreline MD node up to the middle
-    // M0 track (the VD lands on the MRW top, spec 6). A mirrored MD/MD or BMD/BMD
-    // merge alone needs no MRW (Kukner meeting 2026-09-30, 17:04): the two extended
-    // contacts meet directly.
+    // ---- MRW: only where the solution uses the BMD <-> MD via at the centreline.
+    // A mirrored MD/MD or BMD/BMD merge needs no MRW (Kukner meeting 2026-09-30,
+    // 17:04), and a VD from an extended MD to the middle M0 track lands on the MD.
     {
-        std::set<long> cs;
-        for (long c : all_centres(cfg)) cs.insert(c);
         std::set<std::pair<long, long>> mrw_at;
         for (const auto& e : res.metals) {
-            const int za = std::min(e.first[2], e.second[2]), zb = std::max(e.first[2], e.second[2]);
-            const bool vertical = e.first[0] == e.second[0] && e.first[1] == e.second[1];
-            if (!vertical || !cs.count(e.first[1])) continue;
-            const bool lo = std::min(zbmd, zmd) == za && std::max(zbmd, zmd) == zb;   // BMD <-> MD
-            const bool vd = std::min(zmd, zm0) == za && std::max(zmd, zm0) == zb;     // MD <-> M0
-            if (lo || vd) mrw_at.insert({e.first[0], e.first[1]});
+            const int za = e.first[2], zb = e.second[2];
+            if ((za == zbmd && zb == zmd) || (za == zmd && zb == zbmd)) mrw_at.insert({e.first[0], e.first[1]});
         }
         for (const auto& xy : mrw_at)
             S.add("MRW", xy.first - mrw[0] / 2.0, xy.second - mrw[1] / 2.0, xy.first + mrw[0] / 2.0, xy.second + mrw[1] / 2.0);
