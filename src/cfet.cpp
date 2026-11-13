@@ -440,15 +440,23 @@ void cfet_write_gds(const std::string& path, const std::string& cell_name, const
         }
     }
 
-    // ---- MRW: present wherever a contact reaches the centreline (spec 4: a
-    // contact extends over the MRW slot only to land on an MRW)
+    // ---- MRW: where the solution goes through the centreline vertically, i.e. uses
+    // the BMD <-> MD via there, or a VD from the centreline MD node up to the middle
+    // M0 track (the VD lands on the MRW top, spec 6). A mirrored MD/MD or BMD/BMD
+    // merge alone needs no MRW (Kukner meeting 2026-09-30, 17:04): the two extended
+    // contacts meet directly.
     {
-        std::set<std::pair<long, long>> mrw_at;
         std::set<long> cs;
         for (long c : all_centres(cfg)) cs.insert(c);
-        for (const auto& e : res.metals)
-            for (const Arr* n : {&e.first, &e.second})
-                if (((*n)[2] == zmd || (*n)[2] == zbmd) && cs.count((*n)[1])) mrw_at.insert({(*n)[0], (*n)[1]});
+        std::set<std::pair<long, long>> mrw_at;
+        for (const auto& e : res.metals) {
+            const int za = std::min(e.first[2], e.second[2]), zb = std::max(e.first[2], e.second[2]);
+            const bool vertical = e.first[0] == e.second[0] && e.first[1] == e.second[1];
+            if (!vertical || !cs.count(e.first[1])) continue;
+            const bool lo = std::min(zbmd, zmd) == za && std::max(zbmd, zmd) == zb;   // BMD <-> MD
+            const bool vd = std::min(zmd, zm0) == za && std::max(zmd, zm0) == zb;     // MD <-> M0
+            if (lo || vd) mrw_at.insert({e.first[0], e.first[1]});
+        }
         for (const auto& xy : mrw_at)
             S.add("MRW", xy.first - mrw[0] / 2.0, xy.second - mrw[1] / 2.0, xy.first + mrw[0] / 2.0, xy.second + mrw[1] / 2.0);
     }
