@@ -1,5 +1,6 @@
 // Config: design rules, layer stack, and derived routing geometry.
 #pragma once
+#include <algorithm>
 #include <map>
 #include <optional>
 #include <string>
@@ -51,6 +52,25 @@ public:
 
     long width(const std::string& layer) const { return rules.at("width").at(layer).get<long>(); }
     long power_width(const std::string& layer) const { return specs.at("power_width").at(layer).get<long>(); }
+    // Via footprint. A via listed in design_rules "via_size" as [x, y] is a
+    // rectangle of that size; any other via is a square of side width(via),
+    // which is the stock Au-MEDAL model (configs without "via_size" are unchanged).
+    bool has_via_size(const std::string& via) const {
+        return rules.contains("via_size") && rules.at("via_size").contains(via);
+    }
+    long via_wx(const std::string& via) const {
+        return has_via_size(via) ? rules.at("via_size").at(via).at(0).get<long>() : width(via);
+    }
+    long via_wy(const std::string& via) const {
+        return has_via_size(via) ? rules.at("via_size").at(via).at(1).get<long>() : width(via);
+    }
+    // The via's size along a wire running in `dir` (HORIZONTAL -> x, VERTICAL -> y,
+    // BIDIRECTION -> the longer side).
+    long via_along(const std::string& via, int dir) const {
+        if (dir == HORIZONTAL) return via_wx(via);
+        if (dir == VERTICAL) return via_wy(via);
+        return std::max(via_wx(via), via_wy(via));
+    }
     bool is_power_layer(const std::string& layer) const {
         for (const auto& p : power_layer) if (p == layer) return true;
         return false;
