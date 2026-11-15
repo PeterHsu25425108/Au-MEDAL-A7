@@ -11,6 +11,8 @@
 // device (S/D contact MD) and the pFET the bottom device (S/D contact BMD);
 // both share the gate. All coordinates are config units (unit_nm each).
 #pragma once
+#include <array>
+#include <set>
 #include <string>
 #include <vector>
 #include "circuit.hpp"
@@ -48,6 +50,19 @@ void cfet_prune_graph(const Config& cfg, const CfetRows& rows, const std::vector
 // M0 signal-track point within its (tolerance-widened) x range.
 void cfet_add_ext_pin_points(std::vector<Net>& nets, const Config& cfg,
                              const std::vector<std::vector<long>>& x_points, long tolerance);
+
+// placer-todo R1 (CFET_DoubleRow): an M0 wire that ends on a cell-edge column node
+// protrudes 9 nm into the neighbour. cfet.edge_column_m0_cost (config units, 0 = off)
+// is added to the M0-length objective weight of every M0 edge that touches such a
+// node, so the router uses the edge columns only when that saves more M0 than the
+// cost (M1/M2 objectives still rank above it). Only with route_edge_columns.
+long cfet_edge_m0_cost(const Config& cfg);
+// x of the two cell-edge columns, taken from the graph's M0 nodes; empty unless
+// route_edge_columns is set (then the outermost M0 nodes are the edge columns).
+std::set<long> cfet_edge_column_xs(const Config& cfg, const RoutingGraph& g);
+// Number of routed M0 edges touching an edge-column node (reported in the console).
+long cfet_count_edge_m0(const Config& cfg, const RoutingGraph& g,
+                        const std::vector<std::pair<std::array<long, 3>, std::array<long, 3>>>& metals);
 
 void cfet_write_gds(const std::string& path, const std::string& cell_name, const Config& cfg,
                     const RoutingResult& res, const CfetRows& rows);

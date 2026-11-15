@@ -26,6 +26,7 @@ struct RoutingResult {
     std::vector<ExtPin> ext_pins;
     std::vector<long> objective_values;
     long via_count = 0;
+    long edge_m0_edges = 0;   // CFET: routed M0 edges touching a cell-edge column (placer-todo R1)
     long total_length = 0;
     long num_constraints = 0;
     // CFET path only: which net uses each routed edge, and the external nets.

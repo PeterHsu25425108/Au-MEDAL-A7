@@ -536,6 +536,10 @@ ObjSpec build_objective_spec(const Config& cfg, const RoutingGraph& g) {
     const bool pin_stretch = cfg.option.value("pin_stretch_aware", false);
     enum Dir { HORIZONTAL = 0, VERTICAL = 1, BIDIRECTION = 2 };
 
+    // CFET placer-todo R1: extra weight on M0 edges that touch a cell-edge column.
+    const long edge_cost = cfet_edge_m0_cost(cfg);
+    const std::set<long> edge_xs = cfet_edge_column_xs(cfg, g);
+    const int zm0 = layer_index.count("M0") ? layer_index["M0"] : -1;
     std::map<Arr, std::vector<Arr>> adjm;
     for (const auto& e : g.edges) { adjm[e.first].push_back(e.second); adjm[e.second].push_back(e.first); }
     std::map<int, std::vector<Arr>> points_by_z;
@@ -573,7 +577,9 @@ ObjSpec build_objective_spec(const Config& cfg, const RoutingGraph& g) {
                     long priority = 0;
                     if (pin_stretch && ext_pin_zs.count((int)point[2]) && ext_pin_zs.count((int)a[2]))
                         priority = std::min(std::labs(gate_contact_y - point[1]), std::labs(gate_contact_y - a[1]));
-                    const long length = std::labs(point[0] - a[0]) + std::labs(point[1] - a[1]);
+                    long length = std::labs(point[0] - a[0]) + std::labs(point[1] - a[1]);
+                    if (edge_cost > 0 && sln == zm0 && (edge_xs.count(point[0]) || edge_xs.count(a[0])))
+                        length += edge_cost;
                     priorities.insert(priority);
                     mv.emplace_back(length, priority, std::make_pair(point, a));
                 }
@@ -749,6 +755,7 @@ RoutingResult solve_cell(const Config& cfg, const std::vector<std::vector<long>>
                 else r.total_length += std::labs(e.first[0] - e.second[0]) + std::labs(e.first[1] - e.second[1]);
             }
         }
+        r.edge_m0_edges = cfet_count_edge_m0(cfg, g, r.metals);
         for (const auto& kv : smt.vars) {
             const std::string& nm = kv.first;
             if (nm.rfind("VIA_ENC_", 0) != 0 && nm.rfind("EXT_PIN_", 0) != 0) continue;
