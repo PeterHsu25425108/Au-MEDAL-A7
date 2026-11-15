@@ -65,6 +65,12 @@ std::vector<long> all_centres(const Config& cfg) {
 
 }  // namespace
 
+bool cfet_flag(const Config& cfg, const char* k) { return C(cfg).value(k, false); }
+// Columns that carry routing nodes: the interior ones, plus the two cell-edge gate
+// columns when cfet.route_edge_columns is set (the thesis ILP router allowed them;
+// the edge M1 track is shared with the abutting cell).
+long first_col(const Config& cfg) { return cfet_flag(cfg, "route_edge_columns") ? 0 : 1; }
+long last_col_excl(const Config& cfg, long ncols) { return cfet_flag(cfg, "route_edge_columns") ? ncols : ncols - 1; }
 bool is_cfet(const Config& cfg) { return cfg.specs.value("technology", std::string()) == "cfet_a7"; }
 
 namespace {
@@ -133,7 +139,7 @@ CfetTracks cfet_tracks(const Config& cfg, const CfetRows& rows) {
     t.x.assign(L, {}); t.y.assign(L, {}); t.ext_pin_y.assign(L, {});
     // Interior columns only: the cell-edge columns are shared with the neighbour.
     std::vector<long> xs;
-    for (long xi = 1; xi + 1 < rows.ncols; ++xi) xs.push_back(colx(cfg, xi));
+    for (long xi = first_col(cfg); xi < last_col_excl(cfg, rows.ncols); ++xi) xs.push_back(colx(cfg, xi));
 
     std::vector<long> m0 = all_m0_signal(cfg);
     for (long c : all_centres(cfg)) m0.push_back(c);
@@ -258,7 +264,11 @@ void cfet_prune_graph(const Config& cfg, const CfetRows& rows, const std::vector
         const std::vector<long> sig = rys(cfg, r, cv(cfg, "m0_signal_y"));
         const std::vector<long> bsig = rys(cfg, r, cv(cfg, "bm0_signal_y"));
         const long c = centre_y(cfg, r);
-        for (long xi = 1; xi + 1 < rows.ncols; ++xi) {
+        // cfet.route_dummy_contacts: the MD / BMD (and MRW) of a column whose device
+        // in that tier is a dummy are free routing resources (the thesis ILP router
+        // let any net use them). Power-tap contacts stay reserved.
+        const bool dummy_ok = cfet_flag(cfg, "route_dummy_contacts");
+        for (long xi = first_col(cfg); xi < last_col_excl(cfg, rows.ncols); ++xi) {
             const long x = colx(cfg, xi);
             const std::string& n = no.n_net[xi];
             const std::string& p = no.p_net[xi];
@@ -267,8 +277,8 @@ void cfet_prune_graph(const Config& cfg, const CfetRows& rows, const std::vector
                 if (!routed.count(is_dummy(n) ? p : n)) continue;
                 for (long y : sig) ok.insert({x, y, zg});
             } else {
-                const bool n_sig = !is_dummy(n) && !is_supply(cfg, n) && routed.count(n);
-                const bool p_sig = !is_dummy(p) && !is_supply(cfg, p) && routed.count(p);
+                const bool n_sig = (!is_dummy(n) && !is_supply(cfg, n) && routed.count(n)) || (dummy_ok && is_dummy(n));
+                const bool p_sig = (!is_dummy(p) && !is_supply(cfg, p) && routed.count(p)) || (dummy_ok && is_dummy(p));
                 if (n_sig) { for (long y : sig) ok.insert({x, y, zmd}); ok.insert({x, c, zmd}); }
                 if (p_sig) {
                     for (long y : bsig) ok.insert({x, y, zbmd});
@@ -294,9 +304,14 @@ void cfet_prune_graph(const Config& cfg, const CfetRows& rows, const std::vector
 
 void cfet_add_ext_pin_points(std::vector<Net>& nets, const Config& cfg,
                              const std::vector<std::vector<long>>& x_points, long tolerance) {
-    const int z0 = zi(cfg, "M0");
+    // Pin sites (spec §9, decision 2026-11-15): any M0 track including the
+    // middle one, and M1 where it crosses an M0 track. The lexicographic
+    // objective (M1 and V0 are minimised before M0) keeps pins on M0 whenever
+    // an M0 pin fits. Never BM0: PnR cannot route it.
+    const int z0 = zi(cfg, "M0"), z1 = zi(cfg, "M1");
     if (z0 < 0) return;
-    const std::vector<long> ys = all_m0_signal(cfg);
+    std::vector<long> ys = all_m0_signal(cfg);
+    for (long c : all_centres(cfg)) ys.push_back(c);
     for (Net& n : nets) {
         if (!n.is_ext_pin || n.is_power || n.pins.empty()) continue;
         long mn = std::numeric_limits<long>::max(), mx = std::numeric_limits<long>::min();
@@ -305,9 +320,12 @@ void cfet_add_ext_pin_points(std::vector<Net>& nets, const Config& cfg,
         mn -= (long)(tolerance * cfg.x_unit);
         mx += (long)(tolerance * cfg.x_unit);
         Pin ext; ext.term = TERM_EXT_PIN;
-        for (long x : x_points[z0])
-            if (mn <= x && x <= mx)
-                for (long y : ys) ext.points.push_back({x, y, z0});
+        for (int z : {z0, z1}) {
+            if (z < 0 || z >= (int)x_points.size()) continue;
+            for (long x : x_points[z])
+                if (mn <= x && x <= mx)
+                    for (long y : ys) ext.points.push_back({x, y, z});
+        }
         if (!ext.points.empty()) n.pins.push_back(std::move(ext));
     }
 }
@@ -427,7 +445,6 @@ void cfet_write_gds(const std::string& path, const std::string& cell_name, const
             const long x = colx(cfg, xi);
             for (int tier = 0; tier < 2; ++tier) {
                 const std::string& net = tier ? no.p_net[xi] : no.n_net[xi];
-                if (is_dummy(net)) continue;
                 const char* layer = tier ? "BMD" : "MD";
                 const int z = tier ? zbmd : zmd;
                 long lo = ky[0], hi = ky[1];                     // row-A coordinates
@@ -435,6 +452,13 @@ void cfet_write_gds(const std::string& path, const std::string& cell_name, const
                 const std::vector<long> pins = tier ? rys(cfg, r, cv(cfg, "bm0_signal_y")) : rys(cfg, r, cv(cfg, "m0_signal_y"));
                 bool ext = false;
                 for (long y : pins) ext |= has({x, y, z}, {x, c, z});
+                if (is_dummy(net)) {                             // a dummy contact is drawn only when a net routes through it
+                    bool used = false;
+                    for (const auto& e : res.metals)
+                        for (const Arr* a : {&e.first, &e.second})
+                            if ((*a)[2] == z && (*a)[0] == x && ((*a)[1] == c || std::find(pins.begin(), pins.end(), (*a)[1]) != pins.end())) used = true;
+                    if (!used) continue;
+                }
                 if (ext) hi = cover;
                 // An MD that carries a VD up to the middle M0 track without an MRW
                 // extends just far enough to enclose that VD (enclosure along y).

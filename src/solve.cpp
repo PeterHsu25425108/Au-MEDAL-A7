@@ -9,6 +9,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <iostream>
 #include <map>
 #include <optional>
 #include <set>
@@ -139,6 +140,69 @@ std::vector<z3::expr> cfet_min_length(SmtModel& smt, const Config& cfg,
     return out;
 }
 
+// CFET (2026-11-15): minimum wire length stated directly on the edge variables, so it
+// does not depend on the TIP bookkeeping (which misses pieces on A7's 21 nm grid: the
+// feasibility-mode layouts had 2-node M0 pieces of 39 nm and 2-node M1 pieces of 30.5 nm,
+// checker rule D4). For every run of consecutive nodes [i..j] on a track whose drawn
+// length (along[j] - along[i] + extension) is below the minimum: not (all edges inside
+// selected and both neighbouring edges unselected). A single node counts as a piece when
+// a via lands on it.
+std::vector<z3::expr> cfet_min_length_edges(SmtModel& smt, const Config& cfg,
+                                            const std::vector<std::vector<long>>& xp,
+                                            const std::vector<std::vector<long>>& yp, const RoutingGraph& g) {
+    std::vector<z3::expr> out;
+    std::set<std::pair<Arr, Arr>> edges(g.edges.begin(), g.edges.end());
+    std::map<Arr, std::vector<z3::expr>> vias;
+    for (const auto& e : g.edges)
+        if (e.first[2] != e.second[2]) {
+            z3::expr v = smt.bool_var(edge_var_name(e.first, e.second));
+            vias[e.first].push_back(v); vias[e.second].push_back(v);
+        }
+    auto evar = [&](const Arr& a, const Arr& b) -> z3::expr {
+        if (edges.count({a, b}) || edges.count({b, a})) return smt.bool_var(edge_var_name(a, b));
+        return smt.ctx.bool_val(false);
+    };
+    for (int z = 0; z < (int)cfg.routing_layers.size(); ++z) {
+        const std::string& layer = cfg.routing_layers[z];
+        const double min_area = cfg.rules.at("min_area").at(layer).get<double>();
+        if (min_area <= 0) continue;
+        const double min_len = min_area / cfg.width(layer);
+        const long ext = cfg.rules.at("extension").at(layer).get<long>();
+        const bool horiz = cfg.routing_directions[z] == HORIZONTAL;
+        const auto& along_all = horiz ? xp[z] : yp[z];
+        const auto& across = horiz ? yp[z] : xp[z];
+        for (long c : across) {
+            std::vector<long> along;
+            for (long v : along_all) {
+                const Arr n = horiz ? Arr{v, c, z} : Arr{c, v, z};
+                if (g.nodes.count(n)) along.push_back(v);
+            }
+            auto node = [&](size_t k) { return horiz ? Arr{along[k], c, z} : Arr{c, along[k], z}; };
+            for (size_t i = 0; i < along.size(); ++i) {
+                for (size_t j = i; j < along.size() && (double)(along[j] - along[i] + ext) < min_len; ++j) {
+                    z3::expr_vector inside(smt.ctx);
+                    for (size_t k = i; k < j; ++k) inside.push_back(evar(node(k), node(k + 1)));
+                    z3::expr prev_off = i == 0 ? smt.ctx.bool_val(true) : !evar(node(i - 1), node(i));
+                    z3::expr next_off = j + 1 >= along.size() ? smt.ctx.bool_val(true) : !evar(node(j), node(j + 1));
+                    z3::expr piece = inside.empty() ? smt.ctx.bool_val(true) : z3::mk_and(inside);
+                    if (i == j) {
+                        auto it = vias.find(node(i));
+                        if (it == vias.end()) continue;
+                        z3::expr_vector av(smt.ctx);
+                        for (const z3::expr& v : it->second) av.push_back(v);
+                        piece = z3::mk_or(av);
+                    }
+                    out.push_back(!(piece && prev_off && next_off));
+                    if (std::getenv("AUMEDAL_CHECK_MODEL") && layer == "M0" && c == 59 && along[i] == 378 && j > i)
+                        std::cerr << "[CHECK_MODEL] min-length constraint for 378.." << along[j] << ": " << out.back() << "\n";
+                }
+            }
+        }
+    }
+    if (std::getenv("AUMEDAL_CHECK_MODEL")) std::cerr << "[CHECK_MODEL] cfet_min_length_edges: " << out.size() << " constraints\n";
+    return out;
+}
+
 std::vector<z3::expr> collect_graph_constraints(SmtModel& smt, const Config& cfg,
                                                    const std::vector<std::vector<long>>& xp,
                                                    const std::vector<std::vector<long>>& yp,
@@ -163,6 +227,7 @@ std::vector<z3::expr> collect_graph_constraints(SmtModel& smt, const Config& cfg
     if (is_cfet(cfg)) {
         append(all, cfet_landing_needs_wire(smt, cfg, g));
         append(all, cfet_min_length(smt, cfg, xp, yp, g));
+        append(all, cfet_min_length_edges(smt, cfg, xp, yp, g));
     }
     if (!is_cfet(cfg)) {   // CFET: no pre-placed blockage; fixed shapes sit off the routing tracks
         long num_poly = ((long)no.n_net.size() + 1) / 2;
@@ -579,7 +644,11 @@ RoutingResult solve_cell(const Config& cfg, const std::vector<std::vector<long>>
         if (!c.is_true() && seen.insert(c.id()).second) opt.add(c);
     std::vector<z3::optimize::handle> handles;
     const ObjSpec objspec = build_objective_spec(cfg, g);
-    add_objectives(opt, smt.ctx, smt, objspec, handles);
+    // design_option.feasibility_only (2026-11-15): skip the lexicographic objectives, so
+    // opt.check() answers plain SAT/UNSAT. Large CFET cells otherwise spend the whole
+    // time limit optimising after a model exists, and are reported as TIMEOUT.
+    if (!cfg.option.value("feasibility_only", false)) add_objectives(opt, smt.ctx, smt, objspec, handles);
+
     const long graph_asserts = (long)seen.size();
 
     for (long T : schedule) {
@@ -609,13 +678,69 @@ RoutingResult solve_cell(const Config& cfg, const std::vector<std::vector<long>>
         long cut_asserts = 0;
         for (const z3::expr& c : smt.add_cuts(cfg, g, cnets_T))
             if (!c.is_true() && net_seen.insert(c.id()).second) { opt.add(c); ++cut_asserts; }
+        // CFET (2026-11-15): a via may not land on a routing-layer node that carries no
+        // wire. The GDS writer would draw only a 9 nm pad there, shorter than the
+        // minimum wire length (checker rule D4); the TIP-based min-length rule does not
+        // see such nodes because they have no wire end.
+        if (is_cfet(cfg)) {
+            std::set<std::string> wire_layers = {"BM0", "M0", "M1", "M2"};
+            std::map<Arr, std::vector<z3::expr>> in_layer, vias;
+            for (const auto& e : g.edges) {
+                z3::expr v = smt.bool_var(edge_var_name(e.first, e.second));
+                if (e.first[2] == e.second[2]) { in_layer[e.first].push_back(v); in_layer[e.second].push_back(v); }
+                else { vias[e.first].push_back(v); vias[e.second].push_back(v); }
+            }
+            long pad_asserts = 0;
+            for (const auto& kv : vias) {
+                const Arr& n = kv.first;
+                if (!wire_layers.count(cfg.routing_layers[n[2]])) continue;
+                z3::expr_vector anyvia(smt.ctx), anywire(smt.ctx);
+                for (const z3::expr& v : kv.second) anyvia.push_back(v);
+                auto it = in_layer.find(n);
+                if (it != in_layer.end()) for (const z3::expr& v : it->second) anywire.push_back(v);
+                z3::expr c = anywire.empty() ? !z3::mk_or(anyvia) : z3::implies(z3::mk_or(anyvia), z3::mk_or(anywire));
+                opt.add(c); ++pad_asserts;
+            }
+            cut_asserts += pad_asserts;
+        }
         r.num_constraints = graph_asserts + net_asserts + cut_asserts;
 
+        // Edge variables that no graph edge backs (the helpers create them from the
+        // track grids, e.g. for edges cfet_prune_graph removed) must be false: otherwise
+        // the solver sets them to satisfy length / tip rules while nothing is drawn
+        // (2026-11-15: 2-node M0 pieces in the GDS, checker D4).
+        {   // (checked here, inside the per-tolerance scope, so variables created by the net constraints are covered too)
+            std::set<std::pair<Arr, Arr>> edges(g.edges.begin(), g.edges.end());
+            long phantom = 0;
+            for (const auto& kv : smt.vars) {
+                const std::string& nm = kv.first;
+                if (nm.rfind("E_", 0) != 0) continue;
+                long ax, ay, az, bx, by, bz;
+                if (sscanf(nm.c_str(), "E_x%ldy%ldz%ld_x%ldy%ldz%ld", &ax, &ay, &az, &bx, &by, &bz) != 6) continue;
+                Arr a{ax, ay, az}, b{bx, by, bz};
+                if (!edges.count({a, b}) && !edges.count({b, a})) { opt.add(!kv.second); ++phantom; }
+            }
+            if (std::getenv("AUMEDAL_CHECK_MODEL")) std::cerr << "[CHECK_MODEL] " << phantom << " phantom edge variables forced false\n";
+        }
         z3::check_result cr = opt.check();
         if (cr != z3::sat) { opt.pop(); continue; }
         r.sat = true;
         r.tolerance = T;
         z3::model m = opt.get_model();
+        if (cfg.option.value("feasibility_only", false)) {
+            // Phase 2 (2026-11-15): the plain model carries unneeded metal. Forbid every
+            // edge the model did not use and re-solve with the normal lexicographic
+            // objectives inside that small graph: fast, and every rule still holds.
+            opt.push();
+            for (const auto& e : g.edges) {
+                z3::expr v = smt.bool_var(edge_var_name(e.first, e.second));
+                if (!m.eval(v, true).is_true()) opt.add(!v);
+            }
+            std::vector<z3::optimize::handle> h2;
+            add_objectives(opt, smt.ctx, smt, objspec, h2);
+            if (opt.check() == z3::sat) m = opt.get_model();
+            // keep the model; the push scope is popped with the outer scope below
+        }
         for (const auto& e : g.edges) {
             z3::expr v = smt.bool_var(edge_var_name(e.first, e.second));
             if (m.eval(v, true).is_true()) {
@@ -643,6 +768,33 @@ RoutingResult solve_cell(const Config& cfg, const std::vector<std::vector<long>>
                     if (m.eval(smt.bool_var(net_edge_var_name(n.name, e.first, e.second)), false).is_true())
                         r.net_edges.push_back({n.name, e});
             }
+        }
+        if (std::getenv("AUMEDAL_CHECK_MODEL")) {   // debug: which graph constraints does the model violate?
+            long bad = 0;
+            for (const z3::expr& c : graph_constraints)
+                if (!c.is_true() && !m.eval(c, true).is_true()) {
+                    if (bad < 12) std::cerr << "[CHECK_MODEL] violated: " << c << "\n";
+                    ++bad;
+                }
+            std::cerr << "[CHECK_MODEL] " << bad << " of " << graph_constraints.size() << " graph constraints violated by the model\n";
+            {
+                Arr a{336, 59, 4}, b{378, 59, 4};
+                bool ing = g.edges.count({a, b}) > 0, inm = false;
+                for (const auto& e : r.metals) if (e.first == a && e.second == b) inm = true;
+                std::cerr << "[CHECK_MODEL] edge 336-378: in g.edges=" << ing << " eval=" << m.eval(smt.bool_var(edge_var_name(a, b)), true)
+                          << " in r.metals=" << inm << " vars.count=" << smt.vars.count(edge_var_name(a, b)) << "\n";
+            }
+            for (const z3::expr& c : graph_constraints) {
+                std::string str = c.to_string();
+                if (str.find("E_x378y59z4_x420y59z4") != std::string::npos && str.find("min") == std::string::npos && str.size() < 400)
+                    std::cerr << "[CHECK_MODEL] constraint " << str << " => " << m.eval(c, true) << "\n";
+            }
+            for (const auto& e : r.metals)
+                if (cfg.routing_layers[e.first[2]] == "M0" && e.first[2] == e.second[2] && e.first[1] == e.second[1] && e.first[1] <= 80)
+                    std::cerr << "[CHECK_MODEL] M0 edge x " << e.first[0] << "-" << e.second[0] << " y " << e.first[1] << "\n";
+            for (const auto& e : r.metals)
+                if (e.first[2] != e.second[2] && (e.first[0] == 378 || e.first[0] == 420))
+                    std::cerr << "[CHECK_MODEL] via at x " << e.first[0] << " y " << e.first[1] << " z " << e.first[2] << "-" << e.second[2] << "\n";
         }
         for (const auto& h : handles) {
             z3::expr lo = opt.lower(h);
