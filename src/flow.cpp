@@ -191,7 +191,7 @@ int main(int argc, char** argv) try {
                   << " (" << gds_path << ")\n- objective: [";
         for (size_t i = 0; i < r.objective_values.size(); ++i)
             std::cout << (i ? "," : "") << r.objective_values[i];
-        std::cout << "]\n";
+        std::cout << "]\n- edge_m0_edges: " << r.edge_m0_edges << "\n";
         return 0;
     }
 

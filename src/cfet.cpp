@@ -73,6 +73,34 @@ long first_col(const Config& cfg) { return cfet_flag(cfg, "route_edge_columns") 
 long last_col_excl(const Config& cfg, long ncols) { return cfet_flag(cfg, "route_edge_columns") ? ncols : ncols - 1; }
 bool is_cfet(const Config& cfg) { return cfg.specs.value("technology", std::string()) == "cfet_a7"; }
 
+long cfet_edge_m0_cost(const Config& cfg) {
+    if (!is_cfet(cfg) || !cfet_flag(cfg, "route_edge_columns")) return 0;
+    return C(cfg).value("edge_column_m0_cost", 0L);
+}
+std::set<long> cfet_edge_column_xs(const Config& cfg, const RoutingGraph& g) {
+    std::set<long> xs;
+    if (!is_cfet(cfg) || !cfet_flag(cfg, "route_edge_columns")) return xs;
+    const auto& L = cfg.routing_layers;
+    const auto it = std::find(L.begin(), L.end(), "M0");
+    if (it == L.end()) return xs;
+    const long zm0 = it - L.begin();
+    long lo = std::numeric_limits<long>::max(), hi = std::numeric_limits<long>::min();
+    for (const auto& n : g.nodes) if (n[2] == zm0) { lo = std::min(lo, n[0]); hi = std::max(hi, n[0]); }
+    if (lo <= hi) { xs.insert(lo); xs.insert(hi); }
+    return xs;
+}
+long cfet_count_edge_m0(const Config& cfg, const RoutingGraph& g,
+                        const std::vector<std::pair<std::array<long, 3>, std::array<long, 3>>>& metals) {
+    const std::set<long> xs = cfet_edge_column_xs(cfg, g);
+    if (xs.empty()) return 0;
+    const auto& L = cfg.routing_layers;
+    const long zm0 = std::find(L.begin(), L.end(), "M0") - L.begin();
+    long n = 0;
+    for (const auto& e : metals)
+        if (e.first[2] == zm0 && e.second[2] == zm0 && (xs.count(e.first[0]) || xs.count(e.second[0]))) ++n;
+    return n;
+}
+
 namespace {
 // Column-exact net order of one row: an edge dummy gate, then each device's
 // D, G, S with consecutive devices sharing the S/D column (the placement
