@@ -579,7 +579,10 @@ RoutingResult solve_cell(const Config& cfg, const std::vector<std::vector<long>>
         if (!c.is_true() && seen.insert(c.id()).second) opt.add(c);
     std::vector<z3::optimize::handle> handles;
     const ObjSpec objspec = build_objective_spec(cfg, g);
-    add_objectives(opt, smt.ctx, smt, objspec, handles);
+    // design_option.feasibility_only (2026-11-15): skip the lexicographic objectives, so
+    // opt.check() answers plain SAT/UNSAT. Large CFET cells otherwise spend the whole
+    // time limit optimising after a model exists, and are reported as TIMEOUT.
+    if (!cfg.option.value("feasibility_only", false)) add_objectives(opt, smt.ctx, smt, objspec, handles);
     const long graph_asserts = (long)seen.size();
 
     for (long T : schedule) {
