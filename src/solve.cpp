@@ -583,6 +583,7 @@ RoutingResult solve_cell(const Config& cfg, const std::vector<std::vector<long>>
     // opt.check() answers plain SAT/UNSAT. Large CFET cells otherwise spend the whole
     // time limit optimising after a model exists, and are reported as TIMEOUT.
     if (!cfg.option.value("feasibility_only", false)) add_objectives(opt, smt.ctx, smt, objspec, handles);
+
     const long graph_asserts = (long)seen.size();
 
     for (long T : schedule) {
@@ -612,6 +613,31 @@ RoutingResult solve_cell(const Config& cfg, const std::vector<std::vector<long>>
         long cut_asserts = 0;
         for (const z3::expr& c : smt.add_cuts(cfg, g, cnets_T))
             if (!c.is_true() && net_seen.insert(c.id()).second) { opt.add(c); ++cut_asserts; }
+        // CFET (2026-11-15): a via may not land on a routing-layer node that carries no
+        // wire. The GDS writer would draw only a 9 nm pad there, shorter than the
+        // minimum wire length (checker rule D4); the TIP-based min-length rule does not
+        // see such nodes because they have no wire end.
+        if (is_cfet(cfg)) {
+            std::set<std::string> wire_layers = {"BM0", "M0", "M1", "M2"};
+            std::map<Arr, std::vector<z3::expr>> in_layer, vias;
+            for (const auto& e : g.edges) {
+                z3::expr v = smt.bool_var(edge_var_name(e.first, e.second));
+                if (e.first[2] == e.second[2]) { in_layer[e.first].push_back(v); in_layer[e.second].push_back(v); }
+                else { vias[e.first].push_back(v); vias[e.second].push_back(v); }
+            }
+            long pad_asserts = 0;
+            for (const auto& kv : vias) {
+                const Arr& n = kv.first;
+                if (!wire_layers.count(cfg.routing_layers[n[2]])) continue;
+                z3::expr_vector anyvia(smt.ctx), anywire(smt.ctx);
+                for (const z3::expr& v : kv.second) anyvia.push_back(v);
+                auto it = in_layer.find(n);
+                if (it != in_layer.end()) for (const z3::expr& v : it->second) anywire.push_back(v);
+                z3::expr c = anywire.empty() ? !z3::mk_or(anyvia) : z3::implies(z3::mk_or(anyvia), z3::mk_or(anywire));
+                opt.add(c); ++pad_asserts;
+            }
+            cut_asserts += pad_asserts;
+        }
         r.num_constraints = graph_asserts + net_asserts + cut_asserts;
 
         z3::check_result cr = opt.check();
@@ -619,6 +645,20 @@ RoutingResult solve_cell(const Config& cfg, const std::vector<std::vector<long>>
         r.sat = true;
         r.tolerance = T;
         z3::model m = opt.get_model();
+        if (cfg.option.value("feasibility_only", false)) {
+            // Phase 2 (2026-11-15): the plain model carries unneeded metal. Forbid every
+            // edge the model did not use and re-solve with the normal lexicographic
+            // objectives inside that small graph: fast, and every rule still holds.
+            opt.push();
+            for (const auto& e : g.edges) {
+                z3::expr v = smt.bool_var(edge_var_name(e.first, e.second));
+                if (!m.eval(v, true).is_true()) opt.add(!v);
+            }
+            std::vector<z3::optimize::handle> h2;
+            add_objectives(opt, smt.ctx, smt, objspec, h2);
+            if (opt.check() == z3::sat) m = opt.get_model();
+            // keep the model; the push scope is popped with the outer scope below
+        }
         for (const auto& e : g.edges) {
             z3::expr v = smt.bool_var(edge_var_name(e.first, e.second));
             if (m.eval(v, true).is_true()) {
@@ -645,6 +685,53 @@ RoutingResult solve_cell(const Config& cfg, const std::vector<std::vector<long>>
                 for (const auto& e : r.metals)
                     if (m.eval(smt.bool_var(net_edge_var_name(n.name, e.first, e.second)), false).is_true())
                         r.net_edges.push_back({n.name, e});
+            }
+            // feasibility_only: without objectives Z3 may select edges no net needs
+            // (dangling stubs, extra vias). Keep, per net, only edges that stay after
+            // repeatedly removing leaves that are not pin points, and components with a pin.
+            if (cfg.option.value("feasibility_only", false)) {
+                std::map<std::string, std::set<Arr>> pinpts;
+                for (const Net& n : cnets_T)
+                    for (const Pin& p : n.pins)
+                        for (const Point& pt : p.points) pinpts[n.name].insert({pt.x, pt.y, pt.z});
+                std::map<std::string, std::vector<std::pair<Arr, Arr>>> by_net;
+                for (const auto& ne : r.net_edges) by_net[ne.first].push_back(ne.second);
+                std::vector<std::pair<std::string, std::pair<Arr, Arr>>> kept_ne;
+                std::set<std::pair<Arr, Arr>> kept_edges;
+                for (auto& kv : by_net) {
+                    const std::set<Arr>& pins = pinpts[kv.first];
+                    std::vector<std::pair<Arr, Arr>> es = kv.second;
+                    bool changed = true;
+                    while (changed) {
+                        changed = false;
+                        std::map<Arr, int> deg;
+                        for (const auto& e : es) { ++deg[e.first]; ++deg[e.second]; }
+                        std::vector<std::pair<Arr, Arr>> nx;
+                        for (const auto& e : es) {
+                            bool leafA = deg[e.first] == 1 && !pins.count(e.first);
+                            bool leafB = deg[e.second] == 1 && !pins.count(e.second);
+                            if (leafA || leafB) changed = true; else nx.push_back(e);
+                        }
+                        es.swap(nx);
+                    }
+                    // drop components without a pin
+                    std::map<Arr, std::vector<Arr>> adj;
+                    for (const auto& e : es) { adj[e.first].push_back(e.second); adj[e.second].push_back(e.first); }
+                    std::set<Arr> reach;
+                    std::vector<Arr> st;
+                    for (const auto& kv2 : adj) if (pins.count(kv2.first)) { st.push_back(kv2.first); reach.insert(kv2.first); }
+                    while (!st.empty()) {
+                        Arr u = st.back(); st.pop_back();
+                        for (const Arr& v : adj[u]) if (reach.insert(v).second) st.push_back(v);
+                    }
+                    for (const auto& e : es)
+                        if (reach.count(e.first) || reach.count(e.second)) { kept_ne.push_back({kv.first, e}); kept_edges.insert(e); }
+                }
+                r.net_edges.swap(kept_ne);
+                std::vector<std::pair<Arr, Arr>> km;
+                for (const auto& e : r.metals) if (kept_edges.count(e)) km.push_back(e);
+                r.metals.swap(km);
+                recompute_route_metrics(r);
             }
         }
         for (const auto& h : handles) {
