@@ -294,9 +294,14 @@ void cfet_prune_graph(const Config& cfg, const CfetRows& rows, const std::vector
 
 void cfet_add_ext_pin_points(std::vector<Net>& nets, const Config& cfg,
                              const std::vector<std::vector<long>>& x_points, long tolerance) {
-    const int z0 = zi(cfg, "M0");
+    // Pin sites (spec §9, decision 2026-11-15): any M0 track including the
+    // middle one, and M1 where it crosses an M0 track. The lexicographic
+    // objective (M1 and V0 are minimised before M0) keeps pins on M0 whenever
+    // an M0 pin fits. Never BM0: PnR cannot route it.
+    const int z0 = zi(cfg, "M0"), z1 = zi(cfg, "M1");
     if (z0 < 0) return;
-    const std::vector<long> ys = all_m0_signal(cfg);
+    std::vector<long> ys = all_m0_signal(cfg);
+    for (long c : all_centres(cfg)) ys.push_back(c);
     for (Net& n : nets) {
         if (!n.is_ext_pin || n.is_power || n.pins.empty()) continue;
         long mn = std::numeric_limits<long>::max(), mx = std::numeric_limits<long>::min();
@@ -305,9 +310,12 @@ void cfet_add_ext_pin_points(std::vector<Net>& nets, const Config& cfg,
         mn -= (long)(tolerance * cfg.x_unit);
         mx += (long)(tolerance * cfg.x_unit);
         Pin ext; ext.term = TERM_EXT_PIN;
-        for (long x : x_points[z0])
-            if (mn <= x && x <= mx)
-                for (long y : ys) ext.points.push_back({x, y, z0});
+        for (int z : {z0, z1}) {
+            if (z < 0 || z >= (int)x_points.size()) continue;
+            for (long x : x_points[z])
+                if (mn <= x && x <= mx)
+                    for (long y : ys) ext.points.push_back({x, y, z});
+        }
         if (!ext.points.empty()) n.pins.push_back(std::move(ext));
     }
 }
