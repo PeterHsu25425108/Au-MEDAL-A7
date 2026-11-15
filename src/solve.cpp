@@ -9,6 +9,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <iostream>
 #include <map>
 #include <optional>
 #include <set>
@@ -192,10 +193,13 @@ std::vector<z3::expr> cfet_min_length_edges(SmtModel& smt, const Config& cfg,
                         piece = z3::mk_or(av);
                     }
                     out.push_back(!(piece && prev_off && next_off));
+                    if (std::getenv("AUMEDAL_CHECK_MODEL") && layer == "M0" && c == 59 && along[i] == 378 && j > i)
+                        std::cerr << "[CHECK_MODEL] min-length constraint for 378.." << along[j] << ": " << out.back() << "\n";
                 }
             }
         }
     }
+    if (std::getenv("AUMEDAL_CHECK_MODEL")) std::cerr << "[CHECK_MODEL] cfet_min_length_edges: " << out.size() << " constraints\n";
     return out;
 }
 
@@ -701,6 +705,23 @@ RoutingResult solve_cell(const Config& cfg, const std::vector<std::vector<long>>
         }
         r.num_constraints = graph_asserts + net_asserts + cut_asserts;
 
+        // Edge variables that no graph edge backs (the helpers create them from the
+        // track grids, e.g. for edges cfet_prune_graph removed) must be false: otherwise
+        // the solver sets them to satisfy length / tip rules while nothing is drawn
+        // (2026-11-15: 2-node M0 pieces in the GDS, checker D4).
+        {   // (checked here, inside the per-tolerance scope, so variables created by the net constraints are covered too)
+            std::set<std::pair<Arr, Arr>> edges(g.edges.begin(), g.edges.end());
+            long phantom = 0;
+            for (const auto& kv : smt.vars) {
+                const std::string& nm = kv.first;
+                if (nm.rfind("E_", 0) != 0) continue;
+                long ax, ay, az, bx, by, bz;
+                if (sscanf(nm.c_str(), "E_x%ldy%ldz%ld_x%ldy%ldz%ld", &ax, &ay, &az, &bx, &by, &bz) != 6) continue;
+                Arr a{ax, ay, az}, b{bx, by, bz};
+                if (!edges.count({a, b}) && !edges.count({b, a})) { opt.add(!kv.second); ++phantom; }
+            }
+            if (std::getenv("AUMEDAL_CHECK_MODEL")) std::cerr << "[CHECK_MODEL] " << phantom << " phantom edge variables forced false\n";
+        }
         z3::check_result cr = opt.check();
         if (cr != z3::sat) { opt.pop(); continue; }
         r.sat = true;
@@ -747,53 +768,33 @@ RoutingResult solve_cell(const Config& cfg, const std::vector<std::vector<long>>
                     if (m.eval(smt.bool_var(net_edge_var_name(n.name, e.first, e.second)), false).is_true())
                         r.net_edges.push_back({n.name, e});
             }
-            // feasibility_only: without objectives Z3 may select edges no net needs
-            // (dangling stubs, extra vias). Keep, per net, only edges that stay after
-            // repeatedly removing leaves that are not pin points, and components with a pin.
-            if (cfg.option.value("feasibility_only", false)) {
-                std::map<std::string, std::set<Arr>> pinpts;
-                for (const Net& n : cnets_T)
-                    for (const Pin& p : n.pins)
-                        for (const Point& pt : p.points) pinpts[n.name].insert({pt.x, pt.y, pt.z});
-                std::map<std::string, std::vector<std::pair<Arr, Arr>>> by_net;
-                for (const auto& ne : r.net_edges) by_net[ne.first].push_back(ne.second);
-                std::vector<std::pair<std::string, std::pair<Arr, Arr>>> kept_ne;
-                std::set<std::pair<Arr, Arr>> kept_edges;
-                for (auto& kv : by_net) {
-                    const std::set<Arr>& pins = pinpts[kv.first];
-                    std::vector<std::pair<Arr, Arr>> es = kv.second;
-                    bool changed = true;
-                    while (changed) {
-                        changed = false;
-                        std::map<Arr, int> deg;
-                        for (const auto& e : es) { ++deg[e.first]; ++deg[e.second]; }
-                        std::vector<std::pair<Arr, Arr>> nx;
-                        for (const auto& e : es) {
-                            bool leafA = deg[e.first] == 1 && !pins.count(e.first);
-                            bool leafB = deg[e.second] == 1 && !pins.count(e.second);
-                            if (leafA || leafB) changed = true; else nx.push_back(e);
-                        }
-                        es.swap(nx);
-                    }
-                    // drop components without a pin
-                    std::map<Arr, std::vector<Arr>> adj;
-                    for (const auto& e : es) { adj[e.first].push_back(e.second); adj[e.second].push_back(e.first); }
-                    std::set<Arr> reach;
-                    std::vector<Arr> st;
-                    for (const auto& kv2 : adj) if (pins.count(kv2.first)) { st.push_back(kv2.first); reach.insert(kv2.first); }
-                    while (!st.empty()) {
-                        Arr u = st.back(); st.pop_back();
-                        for (const Arr& v : adj[u]) if (reach.insert(v).second) st.push_back(v);
-                    }
-                    for (const auto& e : es)
-                        if (reach.count(e.first) || reach.count(e.second)) { kept_ne.push_back({kv.first, e}); kept_edges.insert(e); }
+        }
+        if (std::getenv("AUMEDAL_CHECK_MODEL")) {   // debug: which graph constraints does the model violate?
+            long bad = 0;
+            for (const z3::expr& c : graph_constraints)
+                if (!c.is_true() && !m.eval(c, true).is_true()) {
+                    if (bad < 12) std::cerr << "[CHECK_MODEL] violated: " << c << "\n";
+                    ++bad;
                 }
-                r.net_edges.swap(kept_ne);
-                std::vector<std::pair<Arr, Arr>> km;
-                for (const auto& e : r.metals) if (kept_edges.count(e)) km.push_back(e);
-                r.metals.swap(km);
-                recompute_route_metrics(r);
+            std::cerr << "[CHECK_MODEL] " << bad << " of " << graph_constraints.size() << " graph constraints violated by the model\n";
+            {
+                Arr a{336, 59, 4}, b{378, 59, 4};
+                bool ing = g.edges.count({a, b}) > 0, inm = false;
+                for (const auto& e : r.metals) if (e.first == a && e.second == b) inm = true;
+                std::cerr << "[CHECK_MODEL] edge 336-378: in g.edges=" << ing << " eval=" << m.eval(smt.bool_var(edge_var_name(a, b)), true)
+                          << " in r.metals=" << inm << " vars.count=" << smt.vars.count(edge_var_name(a, b)) << "\n";
             }
+            for (const z3::expr& c : graph_constraints) {
+                std::string str = c.to_string();
+                if (str.find("E_x378y59z4_x420y59z4") != std::string::npos && str.find("min") == std::string::npos && str.size() < 400)
+                    std::cerr << "[CHECK_MODEL] constraint " << str << " => " << m.eval(c, true) << "\n";
+            }
+            for (const auto& e : r.metals)
+                if (cfg.routing_layers[e.first[2]] == "M0" && e.first[2] == e.second[2] && e.first[1] == e.second[1] && e.first[1] <= 80)
+                    std::cerr << "[CHECK_MODEL] M0 edge x " << e.first[0] << "-" << e.second[0] << " y " << e.first[1] << "\n";
+            for (const auto& e : r.metals)
+                if (e.first[2] != e.second[2] && (e.first[0] == 378 || e.first[0] == 420))
+                    std::cerr << "[CHECK_MODEL] via at x " << e.first[0] << " y " << e.first[1] << " z " << e.first[2] << "-" << e.second[2] << "\n";
         }
         for (const auto& h : handles) {
             z3::expr lo = opt.lower(h);
