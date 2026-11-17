@@ -192,6 +192,8 @@ int main(int argc, char** argv) try {
         for (size_t i = 0; i < r.objective_values.size(); ++i)
             std::cout << (i ? "," : "") << r.objective_values[i];
         std::cout << "]\n- edge_m0_edges: " << r.edge_m0_edges << "\n";
+        if (r.access_nets >= 0)
+            std::cout << "- access_nets: " << r.access_nets << "\n- access_masked_edges: " << r.access_masked_edges << "\n";
         return 0;
     }
 

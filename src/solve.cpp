@@ -358,7 +358,8 @@ void classify_edges_for_masking(const RoutingGraph& g, const std::vector<NInfo>&
                                 const std::set<int>& upper_zs,
                                 const std::function<bool(const std::string&)>& is_true,
                                 const CommTrueFn& comm_true,
-                                std::set<EP>& masking, std::set<EP>& floating) {
+                                std::set<EP>& masking, std::set<EP>& floating,
+                                bool access_by_term = false) {
     for (const auto& e : g.edges) {
         const Arr& point = e.first; const Arr& q = e.second;
         if (!upper_zs.count((int)point[2]) && !upper_zs.count((int)q[2])) continue;
@@ -371,7 +372,11 @@ void classify_edges_for_masking(const RoutingGraph& g, const std::vector<NInfo>&
                 if (i >= ni.comm) continue;
                 if (comm_true(ni.cname, i, point, q)) {
                     any_commodity = true;
-                    if (i == np - 2) any_access = true; else any_real = true;
+                    // access_by_term (CFET): the access commodity is the one whose target
+                    // pin is the access-point pin; a net without access points has none.
+                    const bool is_access = access_by_term ? ni.net->pins[i + 1].term == TERM_ACCESS_POINT
+                                                          : i == np - 2;
+                    if (is_access) any_access = true; else any_real = true;
                 }
             }
         }
@@ -507,11 +512,19 @@ void apply_masking(const Config& cfg, const RoutingGraph& g, const std::vector<N
     };
     std::set<EP> masking, floating;
 
-    classify_edges_for_masking(g, infos, upper_zs, is_true, comm_true, masking, floating);
+    classify_edges_for_masking(g, infos, upper_zs, is_true, comm_true, masking, floating, is_cfet(cfg));
     propagate_floating_edges(masking, floating);
-    restore_edges_for_connectivity(nets, r, masking);
+    // CFET skips the restore: solve_cell already keeps the access wire apart from the
+    // real routing, and the restore treats every candidate point of the external pin
+    // (all M0 nodes in its x range, many of them another net's metal) as a pin of this
+    // net, so it put access M1 pieces back (NAND2x1, 2026-11-17).
+    if (!is_cfet(cfg)) restore_edges_for_connectivity(nets, r, masking);
 
     drop_masked_via_enclosures(masking, r);
+    r.access_masked_edges = (long)masking.size();
+    r.access_nets = 0;
+    for (const Net& n : nets)
+        if (!n.pins.empty() && n.pins.back().term == TERM_ACCESS_POINT) ++r.access_nets;
 
     std::vector<std::pair<Arr, Arr>> kept;
     for (const auto& e : r.metals) if (!masking.count(e)) kept.push_back(e);
@@ -709,6 +722,74 @@ RoutingResult solve_cell(const Config& cfg, const std::vector<std::vector<long>>
             }
             cut_asserts += pad_asserts;
         }
+        // CFET access points (ensure_access_points, 2026-11-17): the access wire (a V0
+        // and an M1 piece) is removed after the solve (apply_masking), so it must not
+        // share metal with the real routing, or the real wires left behind can break
+        // the minimum length (seen as checker D4 on NAND2x1). Two rules per net:
+        // 1. above cfet_access_real_top (set by solve_router when the access layer is
+        //    above the top layer being tried) only the access commodity may route;
+        // 2. at an access-layer node, once an edge carries only the access commodity,
+        //    every wire or via of that net at the node must carry only it too, so the
+        //    access wire is a separate piece (with its own minimum length);
+        // 3. the access commodity climbs into the access layer through one via only and
+        //    never goes above it, so it cannot leave the access layer again and carry an
+        //    M0 piece that is cut off once the access wire is removed (NAND2x1 net B,
+        //    2026-11-17: M0 -> M1 on the edge column -> M0 -> M1).
+        if (is_cfet(cfg) && cfg.option.value("ensure_access_points", false)) {
+            const long real_top = cfg.option.value("cfet_access_real_top", -1L);
+            const std::set<int> acc_zs = ext_pin_upper_zs(cfg);
+            const long acc_lo = acc_zs.empty() ? 0 : *acc_zs.begin();
+            const long acc_hi = acc_zs.empty() ? 0 : *acc_zs.rbegin();
+            long acc_asserts = 0;
+            auto add = [&](const z3::expr& c) { opt.add(c); ++acc_asserts; };
+            for (const Net& n : cnets_T) {
+                if (n.is_power || n.name == DUMMY_NET) continue;
+                const NInfo ni = make_ninfo(n, T, cfg.x_unit, cfg.y_unit, cfg.power_net, cfg.ground_net);
+                const int ncomm = (int)n.pins.size() - 1;
+                const int acc = (ncomm > 0 && n.pins.back().term == TERM_ACCESS_POINT) ? ncomm - 1 : -1;
+                auto comm = [&](int c, const Arr& a, const Arr& b) {
+                    return smt.bool_var(comm_edge_var_name(ni.cname, c, a, b));
+                };
+                auto nedge = [&](const Arr& a, const Arr& b) {
+                    return smt.bool_var(net_edge_var_name(ni.cname, a, b));
+                };
+                std::map<Arr, std::vector<std::pair<Arr, Arr>>> inc;
+                z3::expr_vector entry(smt.ctx);
+                for (const auto& e : g.edges) {
+                    if (!in_box(ni, e.first) || !in_box(ni, e.second)) continue;
+                    if (acc >= 0 && !acc_zs.empty()) {
+                        const long zlo = std::min(e.first[2], e.second[2]), zhi = std::max(e.first[2], e.second[2]);
+                        if (zhi > acc_hi) add(!comm(acc, e.first, e.second));
+                        else if (zlo < acc_lo && zhi >= acc_lo) entry.push_back(comm(acc, e.first, e.second));
+                    }
+                    if (real_top >= 0 && std::max(e.first[2], e.second[2]) > real_top) {
+                        for (int c = 0; c < ncomm; ++c)
+                            if (c != acc) add(!comm(c, e.first, e.second));
+                        add(acc >= 0 ? z3::implies(nedge(e.first, e.second), comm(acc, e.first, e.second))
+                                     : !nedge(e.first, e.second));
+                    }
+                    if (acc >= 0)
+                        for (const Arr* p : {&e.first, &e.second})
+                            if (acc_zs.count((int)(*p)[2])) inc[*p].push_back(e);
+                }
+                if (acc < 0) continue;
+                if (entry.size() > 1) add(z3::atmost(entry, 1));
+                for (const auto& kv : inc) {
+                    z3::expr_vector any(smt.ctx), all(smt.ctx);
+                    for (const auto& e : kv.second) {
+                        z3::expr_vector others(smt.ctx);
+                        for (int c = 0; c < ncomm; ++c)
+                            if (c != acc) others.push_back(comm(c, e.first, e.second));
+                        z3::expr acc_only = others.empty() ? comm(acc, e.first, e.second)
+                                                           : (comm(acc, e.first, e.second) && !z3::mk_or(others));
+                        any.push_back(acc_only);
+                        all.push_back(z3::implies(nedge(e.first, e.second), acc_only));
+                    }
+                    add(z3::implies(z3::mk_or(any), z3::mk_and(all)));
+                }
+            }
+            cut_asserts += acc_asserts;
+        }
         r.num_constraints = graph_asserts + net_asserts + cut_asserts;
 
         // Edge variables that no graph edge backs (the helpers create them from the
@@ -829,7 +910,10 @@ RoutingResult solve_router(const Config& cfg, const Circuit& circ, const NetOrde
         for (const auto& l : candidates) if (l == forced) f.push_back(l);
         candidates.swap(f);
     }
-    if (cfg.option.value("ensure_access_points", false) && !cfg.ext_pin_layer.empty()) {
+    const bool access_points = cfg.option.value("ensure_access_points", false) && !cfg.ext_pin_layer.empty();
+    // CFET keeps every top-layer candidate: the real routing still tries M0 alone first,
+    // and only the access points get the layer above the pin layer (below).
+    if (access_points && !is_cfet(cfg)) {
         int min_top_idx = -1;
         for (const auto& epl : cfg.ext_pin_layer)
             min_top_idx = std::max(min_top_idx, cfg.routing_layer_index(epl));
@@ -844,7 +928,19 @@ RoutingResult solve_router(const Config& cfg, const Circuit& circ, const NetOrde
     for (const std::string& top : candidates) {
         Config cfg_t = cfg;
         auto it = std::find(cfg_t.routing_layers.begin(), cfg_t.routing_layers.end(), top);
-        if (it != cfg_t.routing_layers.end()) cfg_t.routing_layers.erase(it + 1, cfg_t.routing_layers.end());
+        if (it != cfg_t.routing_layers.end()) {
+            // CFET with access points: keep the access layer (the layer above the pin
+            // layer) in the graph even when it is above the top layer. solve_cell then
+            // lets only the access commodities use the layers above the top layer
+            // (cfet_access_real_top), so they are masked away after the solve.
+            long keep = it - cfg_t.routing_layers.begin();
+            if (access_points && is_cfet(cfg)) {
+                long acc = -1;
+                for (int z : ext_pin_upper_zs(cfg)) acc = std::max(acc, (long)z);
+                if (acc > keep) { cfg_t.option["cfet_access_real_top"] = keep; keep = acc; }
+            }
+            cfg_t.routing_layers.erase(cfg_t.routing_layers.begin() + keep + 1, cfg_t.routing_layers.end());
+        }
 
         if (is_cfet(cfg_t)) {
             const CfetRows rows = cfet_rows(cfg_t, circ);

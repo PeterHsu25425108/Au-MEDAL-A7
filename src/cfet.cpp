@@ -89,6 +89,13 @@ std::set<long> cfet_edge_column_xs(const Config& cfg, const RoutingGraph& g) {
     if (lo <= hi) { xs.insert(lo); xs.insert(hi); }
     return xs;
 }
+std::set<long> cfet_edge_xs(const Config& cfg, const std::vector<long>& xs) {
+    std::set<long> out;
+    if (!is_cfet(cfg) || !cfet_flag(cfg, "route_edge_columns") || xs.empty()) return out;
+    out.insert(*std::min_element(xs.begin(), xs.end()));
+    out.insert(*std::max_element(xs.begin(), xs.end()));
+    return out;
+}
 long cfet_count_edge_m0(const Config& cfg, const RoutingGraph& g,
                         const std::vector<std::pair<std::array<long, 3>, std::array<long, 3>>>& metals) {
     const std::set<long> xs = cfet_edge_column_xs(cfg, g);
@@ -350,6 +357,10 @@ void cfet_add_ext_pin_points(std::vector<Net>& nets, const Config& cfg,
         Pin ext; ext.term = TERM_EXT_PIN;
         for (int z : {z0, z1}) {
             if (z < 0 || z >= (int)x_points.size()) continue;
+            // With ensure_access_points a pin must be on M0 (every M0 shape of the net
+            // is pin, spec 9 [DD 11-17]); its access point is then on M1. An M1 pin
+            // would need an M2 access point, which is not modelled.
+            if (z == z1 && cfg.option.value("ensure_access_points", false)) continue;
             for (long x : x_points[z])
                 if (mn <= x && x <= mx)
                     for (long y : ys) ext.points.push_back({x, y, z});

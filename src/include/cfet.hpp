@@ -60,6 +60,9 @@ long cfet_edge_m0_cost(const Config& cfg);
 // x of the two cell-edge columns, taken from the graph's M0 nodes; empty unless
 // route_edge_columns is set (then the outermost M0 nodes are the edge columns).
 std::set<long> cfet_edge_column_xs(const Config& cfg, const RoutingGraph& g);
+// Same, from a layer's x track list (its first and last x); empty unless CFET with
+// route_edge_columns. Used to keep access points off the shared edge columns.
+std::set<long> cfet_edge_xs(const Config& cfg, const std::vector<long>& xs);
 // Number of routed M0 edges touching an edge-column node (reported in the console).
 long cfet_count_edge_m0(const Config& cfg, const RoutingGraph& g,
                         const std::vector<std::pair<std::array<long, 3>, std::array<long, 3>>>& metals);
