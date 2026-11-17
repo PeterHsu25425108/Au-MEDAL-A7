@@ -8,6 +8,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include "cfet.hpp"
 #include "logic.hpp"
 #include "variables.hpp"
 
@@ -233,8 +234,11 @@ void add_access_points(std::vector<Net>& nets, const Config& cfg,
             for (const std::string& upper : it->second) {
                 int uidx = cfg.routing_layer_index(upper);
                 if (uidx < 0 || uidx >= (int)x_points.size() || uidx >= (int)y_points.size()) continue;
+                // CFET: not on the cell-edge columns. Their M1 track is shared with the
+                // neighbour, whose access point may take the same spot.
+                const std::set<long> edge_xs = cfet_edge_xs(cfg, x_points[uidx]);
                 for (long x : x_points[uidx])
-                    if (min_x <= x && x <= max_x)
+                    if (min_x <= x && x <= max_x && !edge_xs.count(x))
                         for (long y : y_points[uidx])
                             if (min_y <= y && y <= max_y)
                                 acc.points.push_back({x, y, uidx});

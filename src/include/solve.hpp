@@ -27,6 +27,9 @@ struct RoutingResult {
     std::vector<long> objective_values;
     long via_count = 0;
     long edge_m0_edges = 0;   // CFET: routed M0 edges touching a cell-edge column (placer-todo R1)
+    // ensure_access_points: nets that got access points, and edges removed by masking
+    // (-1 = access points off; reported in the console only then)
+    long access_nets = -1, access_masked_edges = -1;
     long total_length = 0;
     long num_constraints = 0;
     // CFET path only: which net uses each routed edge, and the external nets.
